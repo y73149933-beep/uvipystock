@@ -1,3 +1,22 @@
-# ADR-001: PostgreSQL as source of truth for balances
+# ADR-001: PostgreSQL как источник истины для балансов
 
-Redis caches the order book; PostgreSQL is the only source of truth for balances.
+## Статус
+Accepted
+
+## Контекст
+Биржа хранит балансы пользователей и стакан ордеров. Нужна стратегия: что является источником истины — PostgreSQL или Redis?
+
+## Решение
+**PostgreSQL — единственный источник истины для балансов.**
+Redis — только кэш стакана и шина событий.
+
+## Обоснование
+- ACID-транзакции PostgreSQL гарантируют консистентность балансов
+- Потеря Redis = потеря производительности, но не денег
+- При рестарте worker-а состояние восстанавливается из PG
+- Redis Sorted Sets не поддерживают транзакции на уровне отдельных операций
+
+## Последствия
+- Каждая сделка = PG транзакция (UPDATE balances + INSERT trades + UPDATE orders)
+- Redis может рассинхронизироваться — нужен механизм reconciliation
+- Worker при старте перебирает `orders WHERE status IN (NEW, PARTIALLY_FILLED)` и перестраивает стакан
