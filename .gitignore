@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyx.bak
+build/
+dist/
+.eggs/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Cython compiled
+backend/app/matching/engine.c
+backend/app/matching/*.so
+
+# Node
+node_modules/
+dist/
+.vite/
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Docker
+pgdata/
+redis-data/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+tool-results/
+upload/

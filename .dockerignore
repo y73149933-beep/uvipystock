@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyx.bak
+build/
+dist/
+.eggs/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Cython compiled artifacts (will be rebuilt in Docker)
+backend/app/matching/engine.c
+backend/app/matching/*.so
+backend/app/matching/build/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Env
+.env
+.env.local
+
+# Git
+.git/
+.gitignore
