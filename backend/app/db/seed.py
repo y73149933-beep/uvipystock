@@ -54,14 +54,24 @@ async def seed_database(session: AsyncSession) -> None:
 
     await _ensure_balance(session, test_user.id, "USDT", Decimal("100000"))
     await _ensure_balance(session, test_user.id, "BTC", Decimal("10"))
+    await _ensure_balance(session, test_user.id, "RUR", Decimal("5000000"))
+    await _ensure_balance(session, test_user.id, "ORION", Decimal("1000"))
     await _ensure_balance(session, test2_user.id, "USDT", Decimal("100000"))
     await _ensure_balance(session, test2_user.id, "BTC", Decimal("10"))
+    await _ensure_balance(session, test2_user.id, "RUR", Decimal("5000000"))
+    await _ensure_balance(session, test2_user.id, "ORION", Decimal("1000"))
 
     pairs_data = [
+        # Криптовалюты
         ("BTC/USDT", "BTC", "USDT", 2, 8),
         ("ETH/USDT", "ETH", "USDT", 2, 8),
         ("SOL/USDT", "SOL", "USDT", 2, 8),
         ("BNB/USDT", "BNB", "USDT", 2, 8),
+        # Фиатные пары
+        ("BTC/RUR", "BTC", "RUR", 2, 8),
+        # Акции
+        ("ORION/USDT", "ORION", "USDT", 2, 4),
+        ("ORION/RUR", "ORION", "RUR", 2, 4),
     ]
     for symbol, base, quote, price_p, qty_p in pairs_data:
         from sqlalchemy import select

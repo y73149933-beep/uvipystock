@@ -35,8 +35,10 @@ export function TradeForm() {
 
   const [loading, setLoading] = useState(false);
 
-  const baseAsset = symbol.split("/")[0] || "BTC";
-  const quoteAsset = symbol.split("/")[1] || "USDT";
+  // Parse base/quote from symbol (e.g. "ORION/RUR" → base="ORION", quote="RUR")
+  const parts = symbol.split("/");
+  const baseAsset = parts[0] || "BTC";
+  const quoteAsset = parts[1] || "USDT";
 
   const availableBase = useBalanceStore((s) => s.getAvailable(baseAsset));
   const availableQuote = useBalanceStore((s) => s.getAvailable(quoteAsset));

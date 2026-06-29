@@ -1,11 +1,10 @@
-import { useMemo } from "react";
+import { useMemo, useEffect } from "react";
 import { useBalanceStore } from "@/store/balanceStore";
 import { useAuthStore } from "@/store/authStore";
 import { useOrderbookStore } from "@/store/orderbookStore";
+import { usePairsStore } from "@/store/pairsStore";
 import { formatUSD, formatPrice } from "@/lib/format";
 import { Button } from "@/components/common/Button";
-
-const SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"];
 
 export function Header() {
   const balances = useBalanceStore((s) => s.balances);
@@ -14,14 +13,21 @@ export function Header() {
   const setSymbol = useOrderbookStore((s) => s.setSymbol);
   const lastTradePrice = useOrderbookStore((s) => s.lastTradePrice);
 
+  const { symbols, fetchPairs } = usePairsStore();
+
+  useEffect(() => {
+    fetchPairs();
+  }, [fetchPairs]);
+
   const totalUSDT = useMemo(() => {
-    // Sum all balances converted to USDT (simplified: just sum USDT + BTC*price)
     let total = 0;
     for (const b of Object.values(balances)) {
       if (b.asset === "USDT") {
         total += parseFloat(b.total);
       } else if (b.asset === "BTC" && lastTradePrice) {
         total += parseFloat(b.total) * lastTradePrice;
+      } else if (b.asset === "RUR") {
+        total += parseFloat(b.total) / 100; // approx RUR/USDT
       }
     }
     return total;
@@ -48,7 +54,7 @@ export function Header() {
           onChange={(e) => setSymbol(e.target.value)}
           className="rounded border border-border bg-panelLight px-3 py-1 text-sm text-gray-100 focus:border-accent focus:outline-none"
         >
-          {SYMBOLS.map((s) => (
+          {symbols.map((s) => (
             <option key={s} value={s}>
               {s}
             </option>
