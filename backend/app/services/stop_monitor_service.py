@@ -58,9 +58,10 @@ class StopMonitorService:
         # Track local extremes per symbol for trailing stops
         self._local_high: dict[str, Decimal] = {}
         self._local_low: dict[str, Decimal] = {}
+        self._refresh_task: asyncio.Task | None = None
 
     async def start(self, symbols: list[str]) -> None:
-        """Start monitoring the given symbols."""
+        """Start monitoring the given symbols + periodic refresh for new pairs."""
         self._running = True
         for symbol in symbols:
             if symbol not in self._tasks:
@@ -71,9 +72,50 @@ class StopMonitorService:
         # Re-evaluate existing pending stops against last trade price
         await self._rescan_pending_stops(symbols)
 
+        # Start periodic refresh — discovers new trading pairs created via admin
+        self._refresh_task = asyncio.create_task(self._periodic_refresh())
+
+    async def _periodic_refresh(self) -> None:
+        """Periodically check for new active trading pairs and start monitoring them.
+
+        This ensures stop orders work on pairs created via admin after startup.
+        Runs every 30 seconds.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                if not self._running:
+                    break
+
+                from app.db.session import async_session_factory
+                from app.repositories.trading_pair_repo import TradingPairRepository
+
+                async with async_session_factory() as session:
+                    repo = TradingPairRepository(session)
+                    pairs = await repo.list_active()
+
+                for pair in pairs:
+                    if pair.symbol not in self._tasks:
+                        task = asyncio.create_task(self._monitor_symbol(pair.symbol))
+                        self._tasks[pair.symbol] = task
+                        logger.info("Stop monitor auto-started for new pair: %s", pair.symbol)
+                        # Rescan pending stops for this new symbol
+                        await self._rescan_pending_stops([pair.symbol])
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Stop monitor refresh error: %s", e)
+
     async def stop(self) -> None:
         """Stop all monitoring tasks."""
         self._running = False
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
         for task in self._tasks.values():
             task.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
@@ -202,13 +244,31 @@ class StopMonitorService:
                     if child_type == OrderType.LIMIT and child_price is not None:
                         lock_amount = child_price * order.quantity
                     else:
-                        # Market buy: compute worst-case from current best ask
-                        best_ask = await orderbook.get_best_ask(redis, order.symbol)
-                        if best_ask is None:
+                        # Market buy: walk the ask side to compute actual cost
+                        # (same logic as OrderService._compute_market_buy_lock)
+                        ask_orders = await orderbook.get_opposite_orders_for_match(
+                            redis, order.symbol, "buy", limit=1000,
+                        )
+                        if not ask_orders:
                             logger.warning("Cannot trigger market buy stop %d: no asks", order_id)
                             return
-                        worst_price = Decimal(str(best_ask[0])) * Decimal("1.01")
-                        lock_amount = worst_price * order.quantity
+
+                        remaining_qty = order.quantity
+                        total_cost = Decimal("0")
+                        for ask in ask_orders:
+                            if remaining_qty <= 0:
+                                break
+                            ask_price = Decimal(str(ask["price"]))
+                            ask_qty = Decimal(str(ask["visible_quantity"] if ask.get("is_iceberg") else ask["quantity"]))
+                            fill_qty = min(remaining_qty, ask_qty)
+                            total_cost += ask_price * fill_qty
+                            remaining_qty -= fill_qty
+
+                        if remaining_qty > 0:
+                            logger.warning("Cannot trigger market buy stop %d: insufficient ask volume", order_id)
+                            return
+
+                        lock_amount = total_cost * Decimal("1.001")  # 0.1% buffer
 
                 try:
                     await balance_svc.lock_optimistic(

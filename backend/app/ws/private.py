@@ -46,29 +46,43 @@ async def handle_private_channel(websocket: WebSocket) -> None:
     if user_id is None:
         # Accept and wait for auth message
         await websocket.accept()
-        await websocket.send_json({
-            "event": "auth_required",
-            "message": "Send auth message within 5 seconds",
-            "ts": int(asyncio.get_event_loop().time()),
-        })
+        try:
+            await websocket.send_json({
+                "event": "auth_required",
+                "message": "Send auth message within 5 seconds",
+                "ts": int(asyncio.get_event_loop().time()),
+            })
+        except Exception:
+            return  # client disconnected before we could send
+
         try:
             user_id = await asyncio.wait_for(
                 _wait_for_auth_message(websocket),
                 timeout=AUTH_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            await websocket.send_json({
-                "event": "auth_timeout",
-                "message": "Authentication timed out",
-            })
-            await websocket.close(code=4001)
+            try:
+                await websocket.send_json({
+                    "event": "auth_timeout",
+                    "message": "Authentication timed out",
+                })
+                await websocket.close(code=4001)
+            except Exception:
+                pass
+            return
+        except WebSocketDisconnect:
+            # Client disconnected during auth — don't try to send, just return
             return
         except Exception as e:
-            await websocket.send_json({
-                "event": "auth_failed",
-                "message": str(e),
-            })
-            await websocket.close(code=4003)
+            # Only send error if the connection is still open
+            try:
+                await websocket.send_json({
+                    "event": "auth_failed",
+                    "message": str(e),
+                })
+                await websocket.close(code=4003)
+            except Exception:
+                pass
             return
     else:
         await websocket.accept()

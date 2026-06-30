@@ -293,7 +293,8 @@ class TradeService:
         """Update Redis HASH for a maker order after a fill.
 
         If the maker is fully filled, remove from book + indexes.
-        Otherwise, update the HASH's filled_quantity.
+        Otherwise, update the HASH's filled_quantity AND visible_quantity
+        (so the order book snapshot shows the correct remaining volume).
         """
         if maker_order.status == OrderStatus.FILLED:
             await orderbook.remove_resting_order(
@@ -306,9 +307,15 @@ class TradeService:
                 redis, maker_order.user_id, maker_order.symbol, maker_order.id,
             )
         else:
-            # Update HASH with new filled_quantity
+            # Update HASH with new filled_quantity + visible_quantity
+            # visible_quantity is what the order book snapshot uses to display
+            # the remaining volume. Without this update, the book shows the
+            # original quantity even after a partial fill.
+            remaining = maker_order.quantity - maker_order.filled_quantity
             await orderbook.update_order_hash_fields(redis, maker_order.id, {
                 "filled_quantity": str(maker_order.filled_quantity),
+                "visible_quantity": str(remaining),
+                "quantity": str(remaining),
                 "status": maker_order.status.value,
             })
 

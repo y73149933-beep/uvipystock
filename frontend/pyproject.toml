@@ -1,0 +1,79 @@
+[project]
+name = "crypto-exchange-sandbox"
+version = "0.1.0"
+description = "Educational crypto exchange sandbox (paper trading)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110,<0.120",
+    "uvicorn[standard]>=0.27",
+    "sqlalchemy[asyncio]>=2.0.25,<2.1",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.1",
+    "redis>=5.0,<6",
+    "cython>=3.0",
+    "passlib[bcrypt]>=1.7",
+    "hiredis>=2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "black>=24.0",
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["app*"]
+
+# ─── Black ───────────────────────────────────────────────────────────────────
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+# ─── Ruff ────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["backend"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "ASYNC",         # async lints
+    "RUF",           # ruff-specific
+]
+ignore = ["E501"]    # line-length handled by black
+
+[tool.ruff.lint.per-file-ignores]
+"backend/alembic/versions/*" = ["E", "F"]
+
+# ─── Mypy ────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+exclude = ["backend/alembic/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["alembic.*", "passlib.*"]
+ignore_missing_imports = true
+
+# ─── Pytest ──────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]

@@ -68,8 +68,8 @@ def build_order_action_payload(
         payload["price"] = price
     if stop_price is not None:
         payload["stop_price"] = stop_price
-    if quantity is not None:
-        payload["quantity"] = quantity
+    # quantity is ALWAYS required for place/modify actions — include even if 0
+    payload["quantity"] = quantity if quantity is not None else 0.0
     if is_iceberg:
         payload["is_iceberg"] = True
         payload["visible_qty"] = visible_qty

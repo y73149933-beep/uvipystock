@@ -1,0 +1,161 @@
+# Crypto Exchange Sandbox — full stack docker-compose
+#
+# Usage:
+#   cp .env.example .env
+#   docker compose up -d
+#
+# Services:
+#   postgres   — PostgreSQL 15 (database)
+#   redis      — Redis 7 (cache + message broker)
+#   backend    — FastAPI app (REST + WS)
+#   worker     — Matching worker (consumes queue:orders)
+#   frontend   — Trading terminal (Vite SPA → nginx)
+#   admin      — Admin panel (Vite SPA → nginx)
+#   nginx      — Reverse proxy (port 80 → all services)
+#
+# After startup:
+#   - Frontend:    http://localhost (trading terminal)
+#   - Admin:       http://localhost/admin (admin panel)
+#   - API docs:    http://localhost/docs (Swagger)
+#   - PostgreSQL:  localhost:5432
+#   - Redis:       localhost:6379
+
+services:
+  # ─── Database ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: exchange-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-exchange}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-exchange}
+      POSTGRES_DB: ${POSTGRES_DB:-exchange}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-exchange}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: exchange-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ─── Backend (FastAPI + Cython) ────────────────────────────────────────────
+  backend:
+    image: crypto-exchange-backend
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    container_name: exchange-backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-exchange}:${POSTGRES_PASSWORD:-exchange}@postgres:5432/${POSTGRES_DB:-exchange}
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: ${APP_ENV:-development}
+      APP_SECRET: ${APP_SECRET:-change-me-in-production-use-32-chars}
+      HMAC_REPLAY_WINDOW_SECONDS: ${HMAC_REPLAY_WINDOW_SECONDS:-30}
+      DEFAULT_RATE_LIMIT_PER_MIN: ${DEFAULT_RATE_LIMIT_PER_MIN:-120}
+      PYTHONPATH: /app/backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+  # ─── Matching Worker ───────────────────────────────────────────────────────
+  # Uses the SAME backend Dockerfile with a different command.
+  # Do NOT use a separate worker.Dockerfile that does FROM crypto-exchange-backend
+  # — that causes "image not found" because Docker builds in parallel.
+  worker:
+    image: crypto-exchange-backend
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    container_name: exchange-worker
+    command: ["sh", "-c", "cd /app/backend && python -m app.matching.worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-exchange}:${POSTGRES_PASSWORD:-exchange}@postgres:5432/${POSTGRES_DB:-exchange}
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: ${APP_ENV:-development}
+      PYTHONPATH: /app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    # No healthcheck — the worker logs its own status and restarts on crash.
+    # A healthcheck that pings Redis would create extra connections that
+    # interfere with the dedicated BRPOP connection.
+    restart: unless-stopped
+
+  # ─── Frontend (Trading Terminal) ───────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: infra/docker/frontend.Dockerfile
+    container_name: exchange-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # ─── Admin Panel ───────────────────────────────────────────────────────────
+  admin:
+    build:
+      context: .
+      dockerfile: infra/docker/admin.Dockerfile
+    container_name: exchange-admin
+    ports:
+      - "3001:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # ─── Nginx Reverse Proxy (optional: unify all under port 80) ───────────────
+  nginx:
+    image: nginx:alpine
+    container_name: exchange-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+      admin:
+        condition: service_started
+    restart: unless-stopped
+    profiles: ["full"]  # Only starts with `docker compose --profile full up`
+
+volumes:
+  pgdata:
+  redisdata:

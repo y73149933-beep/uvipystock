@@ -353,8 +353,18 @@ class MatchingWorker:
         # 7. If taker has remaining qty and is LIMIT/POST_ONLY/ICEBERG → insert as resting
         if remaining > 0 and payload.type in ("limit", "post_only", "iceberg"):
             await self._insert_resting_taker(payload, remaining)
-        elif remaining > 0 and payload.type == "market" and payload.side == "buy":
-            # Market buy with leftover lock → refund the difference
+        elif payload.side == "buy" and (
+            payload.type == "market"
+            or (remaining == 0 and payload.type in ("limit", "stop_limit"))
+        ):
+            # Refund unused locked quote asset for buy orders:
+            # - Market buy: worst-case lock >= actual cost (always refund)
+            # - Limit buy fully filled: if executed at a BETTER price than
+            #   the limit, the savings (limit_price - fill_price) * qty
+            #   remain locked forever without this refund.
+            # - Stop-limit buy fully filled: same issue.
+            # Note: partial fills with remaining > 0 keep the locked amount
+            # for the resting portion (handled by _insert_resting_taker).
             await self._refund_market_buy_leftover(payload, remaining)
 
         # 8. Publish orderbook update (L2 delta)
@@ -395,19 +405,58 @@ class MatchingWorker:
     async def _refund_market_buy_leftover(
         self, payload: OrderActionPayload, remaining_qty: float,
     ) -> None:
-        """Refund the unused quote asset for a market buy that didn't fully fill.
+        """Refund unused locked quote asset after a buy order.
 
-        The order service locked worst-case (best_ask * 1.01 * qty) at placement.
-        The actual cost was less, so we refund the difference.
+        Works for both market and limit buy orders:
+        - Market buy: locks worst-case (walk-the-book * 1.001), actual
+          cost may be less → refund difference
+        - Limit buy (fully filled): locks limit_price * qty, but if
+          executed at a better price, the savings remain locked
+
+        The settle operation already deducted the actual trade cost from
+        locked. Whatever remains in locked is the unused buffer →
+        unlock it back to available.
         """
-        # This requires knowing the actual fill price vs the locked estimate.
-        # For simplicity, we refund `remaining_qty * worst_case_price`.
-        # A full implementation would track the exact locked amount on the Order row.
-        # TODO: implement proper refund tracking in Step 2e.
-        logger.info(
-            "Market buy %d has leftover %f — refund pending (TODO)",
-            payload.order_id, remaining_qty,
-        )
+        from app.db.session import async_session_factory
+        from app.services.balance_service import BalanceService
+        from app.repositories.balance_repo import BalanceRepository
+        from app.repositories.trading_pair_repo import TradingPairRepository
+        from decimal import Decimal
+
+        async with async_session_factory() as session:
+            async with session.begin():
+                pair_repo = TradingPairRepository(session)
+                pair = await pair_repo.get_by_symbol(payload.symbol)
+                if pair is None:
+                    logger.error("Trading pair %s not found for refund", payload.symbol)
+                    return
+
+                quote_asset = pair.quote_asset
+                bal_repo = BalanceRepository(session)
+                balance = await bal_repo.get_for_update(payload.user_id, quote_asset)
+
+                if balance is None:
+                    logger.warning("No %s balance for user %d — nothing to refund",
+                                   quote_asset, payload.user_id)
+                    return
+
+                leftover = balance.locked_balance
+                if leftover > 0:
+                    logger.info(
+                        "Refunding market buy leftover: user=%d %s locked=%s → available",
+                        payload.user_id, quote_asset, leftover,
+                    )
+                    balance_svc = BalanceService(session)
+                    await balance_svc.unlock_pessimistic(
+                        balance, leftover,
+                        reason="market_buy_refund",
+                        order_id=payload.order_id,
+                    )
+                else:
+                    logger.debug(
+                        "No leftover to refund for market buy %d (user=%d %s locked=0)",
+                        payload.order_id, payload.user_id, quote_asset,
+                    )
 
     async def _publish_orderbook_delta(self, symbol: str) -> None:
         """Publish an L2 snapshot after a match (simpler than delta computation)."""

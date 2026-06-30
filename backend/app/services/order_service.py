@@ -251,22 +251,50 @@ class OrderService:
         dto: OrderCreateDTO,
         pair: TradingPair,
     ) -> tuple[str, Decimal]:
-        """For MARKET BUY, compute worst-case lock using the best ask price.
+        """For MARKET BUY, compute the actual cost by walking the ask side.
 
-        If the book is empty, the order cannot execute → reject.
-        The matching worker will refund the difference after execution.
+        Walks the order book from best ask upward, accumulating volume
+        until the requested quantity is covered. The total cost = sum of
+        (price * volume) at each level. If the book doesn't have enough
+        volume, rejects the order.
+
+        A small buffer (0.1%) is added to handle race conditions where
+        the book changes between lock and match.
         """
         redis = get_redis()
-        best_ask = await orderbook.get_best_ask(redis, dto.symbol)
-        if best_ask is None:
+        # Load asks from Redis (ascending price order)
+        ask_orders = await orderbook.get_opposite_orders_for_match(
+            redis, dto.symbol, "buy", limit=1000,
+        )
+
+        if not ask_orders:
             raise OrderValidationError(
                 f"Cannot place MARKET BUY on {dto.symbol}: no asks available"
             )
-        worst_price = Decimal(str(best_ask[0]))
-        # Add a small buffer (1% above best ask) to handle slippage during
-        # the time between placement and matching.
-        buffer = worst_price * Decimal("1.01")
-        return (pair.quote_asset, buffer * dto.quantity)
+
+        # Walk the asks and accumulate cost
+        remaining_qty = dto.quantity
+        total_cost = Decimal("0")
+
+        for ask in ask_orders:
+            if remaining_qty <= 0:
+                break
+            ask_price = Decimal(str(ask["price"]))
+            ask_qty = Decimal(str(ask["visible_quantity"] if ask.get("is_iceberg") else ask["quantity"]))
+
+            fill_qty = min(remaining_qty, ask_qty)
+            total_cost += ask_price * fill_qty
+            remaining_qty -= fill_qty
+
+        if remaining_qty > 0:
+            raise OrderValidationError(
+                f"Cannot place MARKET BUY {dto.quantity} {pair.base_asset} on {dto.symbol}: "
+                f"insufficient ask volume in the order book"
+            )
+
+        # Small buffer (0.1%) for race conditions between lock and match
+        buffer = total_cost * Decimal("1.001")
+        return (pair.quote_asset, buffer)
 
     # ─── PLACE ──────────────────────────────────────────────────────────────
 
@@ -522,10 +550,21 @@ class OrderService:
         # Only unlock if this is not a stop-type (stops don't lock at placement)
         is_stop = order.type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP)
         if not is_stop and unlock_amount > 0:
-            await self.balance_svc.unlock_optimistic(
-                user_id, unlock_asset, unlock_amount,
-                reason="order_canceled", order_id=order.id,
-            )
+            # Use PESSIMISTIC locking (FOR UPDATE) instead of optimistic.
+            # The matching worker may have just modified the balance (version bump),
+            # causing optimistic lock to fail with BalanceVersionConflict.
+            # Pessimistic locking waits for the worker's transaction to commit,
+            # then reads the current locked_balance and unlocks correctly.
+            balance = await self.balance_svc.repo.get_for_update(user_id, unlock_asset)
+            if balance is not None:
+                # Only unlock what's actually locked (may be less than calculated
+                # if the worker partially settled)
+                actual_unlock = min(unlock_amount, balance.locked_balance)
+                if actual_unlock > 0:
+                    await self.balance_svc.unlock_pessimistic(
+                        balance, actual_unlock,
+                        reason="order_canceled", order_id=order.id,
+                    )
 
         # Update status
         await self.repo.update_status(order.id, OrderStatus.CANCELED)
@@ -567,6 +606,15 @@ class OrderService:
             status=OrderStatus.CANCELED.value,
             filled_quantity=float(order.filled_quantity),
             remaining_quantity=0.0,
+        )
+
+        # Publish orderbook snapshot so the frontend updates the order book
+        # immediately after an order is removed (not just on new trades).
+        snap = await orderbook.get_book_snapshot(redis, order.symbol, depth=20)
+        await pubsub.publish_orderbook_snapshot(
+            redis, order.symbol,
+            bids=[[p, q] for p, q in snap["bids"]],
+            asks=[[p, q] for p, q in snap["asks"]],
         )
 
         # Reload to get final state

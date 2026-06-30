@@ -78,6 +78,13 @@ async function request<T>(
   });
 
   if (!resp.ok) {
+    // On 401, clear stale credentials and redirect to login
+    if (resp.status === 401) {
+      clearStoredCredentials();
+      if (window.location.pathname !== "/login" && window.location.pathname !== "/register") {
+        window.location.href = "/login";
+      }
+    }
     let errorBody: { error?: { code?: string; message?: string; details?: Record<string, unknown> } };
     try {
       errorBody = await resp.json();
