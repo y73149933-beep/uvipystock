@@ -342,7 +342,9 @@ class OrderService:
         # Determine initial status
         initial_status = OrderStatus.PENDING if is_stop else OrderStatus.NEW
 
-        # Insert order
+        # Insert order. `locked_amount` records the exact reservation this
+        # order owns so cancel/modify can refund it precisely (0 for stops —
+        # they lock nothing at placement).
         order = Order(
             user_id=user_id,
             symbol=dto.symbol,
@@ -356,6 +358,7 @@ class OrderService:
             visible_quantity=dto.visible_quantity if dto.type == "iceberg" else dto.quantity,
             hidden_quantity=dto.hidden_quantity if dto.type == "iceberg" else None,
             bulk_id=dto.bulk_id,
+            locked_amount=lock_amount if not is_stop else Decimal("0"),
         )
         self.session.add(order)
         await self.session.flush()  # get order.id
@@ -499,6 +502,9 @@ class OrderService:
         }
         await orderbook.store_order_hash(redis, order.id, metadata)
 
+        # Public stop-ladder visibility: this level just appeared
+        await pubsub.publish_stops_changed(redis, order.symbol)
+
     # ─── CANCEL ─────────────────────────────────────────────────────────────
 
     async def cancel_order(
@@ -509,9 +515,9 @@ class OrderService:
         """Cancel a single order and unlock remaining balance.
 
         Steps:
-          1. Load order (verify ownership)
+          1. Load order WITH FOR UPDATE (serializes vs worker settlement)
           2. Verify it's active (NEW / PARTIALLY_FILLED / PENDING)
-          3. Compute unlock amount based on remaining quantity
+          3. Unlock exactly `locked_amount` (per-order reservation)
           4. Unlock balance
           5. Update order status to CANCELED
           6. Cancel SL/TP children
@@ -519,7 +525,9 @@ class OrderService:
           8. Enqueue cancel action to matching worker (for in-flight matches)
           9. Publish events
         """
-        order = await self.repo.get_by_user(order_id, user_id)
+        # FOR UPDATE: the matching worker may be settling a fill on this row
+        # right now (decrementing locked_amount). Row lock serializes us.
+        order = await self.repo.get_by_user_for_update(order_id, user_id)
         if order is None:
             raise OrderNotFoundError(f"Order {order_id} not found for user {user_id}")
 
@@ -531,24 +539,26 @@ class OrderService:
         pair = await self.pair_repo.get_by_symbol(order.symbol)
         assert pair is not None
 
-        # Compute unlock amount
-        remaining = order.remaining_quantity
+        # Unlock EXACTLY what this order still reserves.
+        # Recomputing from remaining*price leaks funds:
+        #   * market buy has no price → unlock 0 (funds stuck forever);
+        #   * limit buy filled at better prices → over-unlocks the savings.
+        # `locked_amount` is maintained by settlement on every fill and is
+        # therefore the authoritative residual reservation.
+        is_stop = order.type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP)
         if order.side == OrderSide.SELL:
             unlock_asset = pair.base_asset
-            unlock_amount = remaining
         else:
             unlock_asset = pair.quote_asset
-            if order.price is not None:
-                unlock_amount = remaining * order.price
-            else:
-                # Market buy: unlock the worst-case estimate (stored nowhere —
-                # we need to look it up from Redis or recompute). For simplicity,
-                # assume the full locked amount is the worst-case.
-                # TODO: track locked_amount on the Order row.
-                unlock_amount = remaining * (order.stop_price or Decimal("0"))
+        if is_stop:
+            # Stops lock nothing at placement; their funded children carry
+            # their own locked_amount and are canceled separately.
+            unlock_amount = Decimal("0")
+        elif order.status == OrderStatus.PENDING:
+            unlock_amount = Decimal("0")
+        else:
+            unlock_amount = order.locked_amount or Decimal("0")
 
-        # Only unlock if this is not a stop-type (stops don't lock at placement)
-        is_stop = order.type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP)
         if not is_stop and unlock_amount > 0:
             # Use PESSIMISTIC locking (FOR UPDATE) instead of optimistic.
             # The matching worker may have just modified the balance (version bump),
@@ -586,6 +596,10 @@ class OrderService:
             )
             await orderbook.delete_order_hash(redis, order.id)
         await orders_index.remove_open_order(redis, user_id, order.symbol, order.id)
+
+        if is_stop:
+            # Public stop-ladder visibility: the level lost volume/vanished
+            await pubsub.publish_stops_changed(redis, order.symbol)
 
         # Enqueue cancel action (so matching worker can skip in-flight matches)
         payload = queues.build_order_action_payload(
@@ -662,14 +676,14 @@ class OrderService:
         pair = await self.pair_repo.get_by_symbol(old_order.symbol)
         assert pair is not None
 
-        # 1. Unlock old remaining balance
-        remaining = old_order.remaining_quantity
+        # 1. Unlock old remaining balance — exact per-order reservation
+        # (locked_amount already accounts for partial fills settled by the
+        # worker; recomputing from remaining*price would over/under-unlock).
         if old_order.side == OrderSide.SELL:
             old_unlock_asset = pair.base_asset
-            old_unlock_amount = remaining
         else:
             old_unlock_asset = pair.quote_asset
-            old_unlock_amount = remaining * (old_order.price or Decimal("0"))
+        old_unlock_amount = old_order.locked_amount or Decimal("0")
 
         if old_unlock_amount > 0:
             await self.balance_svc.unlock_optimistic(
@@ -715,7 +729,7 @@ class OrderService:
         old_order.replaced_by_id = None  # will set after new is created
         await self.repo.update_status(old_order.id, OrderStatus.CANCELED)
 
-        # 4. Insert new order
+        # 4. Insert new order (fresh reservation for the new parameters)
         new_order = Order(
             user_id=user_id,
             symbol=old_order.symbol,
@@ -728,6 +742,7 @@ class OrderService:
             hidden_quantity=(old_order.hidden_quantity if old_order.type == OrderType.ICEBERG else None),
             replaces_id=old_order.id,
             replace_count=old_order.replace_count + 1,
+            locked_amount=new_lock_amount,
         )
         self.session.add(new_order)
         await self.session.flush()
@@ -761,9 +776,25 @@ class OrderService:
         }
         await orderbook.store_order_hash(redis, new_order.id, metadata)
 
-        # 6. Enqueue modify action
+        # 6. Enqueue worker actions.
+        # The worker pipeline understands "place" end-to-end (match → settle
+        # → rest remainder). A dedicated "modify" action was never implemented
+        # there — the new order stayed NEW forever, invisible to matching while
+        # its funds stayed locked. So we enqueue the new order as a regular
+        # placement, preceded by a cancel no-op for the old id (ack'ed by the
+        # worker) to keep in-flight pipelines consistent.
+        cancel_payload = queues.build_order_action_payload(
+            action="cancel",
+            order_id=old_order.id,
+            symbol=old_order.symbol,
+            user_id=user_id,
+            side=old_order.side.value,
+            type=old_order.type.value,
+        )
+        await queues.enqueue_order_action(redis, cancel_payload)
+
         payload = queues.build_order_action_payload(
-            action="modify",
+            action="place",
             order_id=new_order.id,
             symbol=new_order.symbol,
             user_id=user_id,
@@ -771,6 +802,9 @@ class OrderService:
             type=new_order.type.value,
             price=float(new_order.price) if new_order.price else None,
             quantity=float(new_order.quantity),
+            is_iceberg=(new_order.type == OrderType.ICEBERG),
+            visible_qty=float(new_order.visible_quantity) if new_order.visible_quantity else None,
+            hidden_qty=float(new_order.hidden_quantity) if new_order.hidden_quantity else None,
             replaces_id=old_order.id,
         )
         await queues.enqueue_order_action(redis, payload)
@@ -886,6 +920,7 @@ class OrderService:
                 visible_quantity=dto.visible_quantity if dto.type == "iceberg" else dto.quantity,
                 hidden_quantity=dto.hidden_quantity if dto.type == "iceberg" else None,
                 bulk_id=bulk_id,
+                locked_amount=lock_amount if not is_stop else Decimal("0"),
             )
             self.session.add(order)
             await self.session.flush()

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { PublicSocket } from "@/ws/publicSocket";
 import { useOrderbookStore } from "@/store/orderbookStore";
+import { useStopLadderStore } from "@/store/stopLadderStore";
 import { useTradesStore } from "@/store/tradesStore";
 import { useChartStore } from "@/store/chartStore";
 
@@ -15,6 +16,7 @@ export function useOrderbookFeed(symbol: string) {
   const addTrade = useTradesStore((s) => s.addTrade);
   const updateLastPrice = useChartStore((s) => s.updateLastPrice);
   const addTradeToCandle = useChartStore((s) => s.addTradeToCandle);
+  const fetchLadder = useStopLadderStore((s) => s.fetchLadder);
 
   useEffect(() => {
     const socket = new PublicSocket(symbol);
@@ -27,6 +29,12 @@ export function useOrderbookFeed(symbol: string) {
           break;
         case "orderbook_update":
           applyUpdate(msg);
+          break;
+        case "stops_changed":
+          // Conditional-order ladder changed on the server — refetch it.
+          if (msg.symbol === symbol) {
+            void fetchLadder(symbol);
+          }
           break;
         case "trade":
           addTrade(msg);
@@ -43,5 +51,5 @@ export function useOrderbookFeed(symbol: string) {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [symbol, applySnapshot, applyUpdate, addTrade, updateLastPrice, addTradeToCandle]);
+  }, [symbol, applySnapshot, applyUpdate, addTrade, updateLastPrice, addTradeToCandle, fetchLadder]);
 }

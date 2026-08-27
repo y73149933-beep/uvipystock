@@ -28,6 +28,21 @@ Design highlights
 6. **Partial fill tracking**
    `filled_quantity` and `filled_quote_qty` enable computing `avg_fill_price`
    on the fly without denormalizing it.
+
+7. **Per-order balance reservation**
+   `locked_amount` records how much of the lock asset THIS order currently
+   reserves in the user's `locked_balance`:
+     * LIMIT-family buy  → price * quantity at placement, decremented by the
+       actual quote cost on every fill;
+     * MARKET BUY        → worst-case walk-the-book estimate * 1.001,
+       decremented by actual cost on every fill and finally refunded;
+     * SELL orders       → base quantity remaining, decrement mirrors fills;
+     * STOP-type / PENDING SL-TP children → 0 (nothing is locked until the
+       trigger fires and creates a funded child order).
+   The value is authoritative for cancel/modify refunds — recomputing it from
+   price*remaining would leak funds for market buys (no price) and for limit
+   buys filled at better prices. It is meaningful only while the order is
+   active; terminal orders keep their last value for audit.
 """
 from __future__ import annotations
 
@@ -106,6 +121,12 @@ class Order(Base):
     # Iceberg-specific (nullable for non-iceberg orders)
     visible_quantity: Mapped[Optional[Decimal]] = mapped_column(Numeric(36, 18), nullable=True)
     hidden_quantity:  Mapped[Optional[Decimal]] = mapped_column(Numeric(36, 18), nullable=True)
+
+    # Balance reservation owned by this order (see docstring item 7).
+    # Decrement on every fill; refund/unlock from this exact value.
+    locked_amount: Mapped[Decimal] = mapped_column(
+        Numeric(36, 18), nullable=False, default=Decimal("0"), server_default="0",
+    )
 
     # ─── Cancel-Replace traceability ─────────────────────────────────────────
     replace_count:  Mapped[int]            = mapped_column(Integer, nullable=False, default=0)

@@ -39,10 +39,11 @@ async def create_trading_pair(
 async def list_trading_pairs(
     admin: AdminUser,
     session: SessionDep,
+    include_inactive: bool = False,
 ) -> list[AdminTradingPairResponse]:
-    """List all active trading pairs."""
+    """List trading pairs (pass include_inactive=true to see deactivated ones)."""
     svc = AdminService(session)
-    pairs = await svc.list_trading_pairs()
+    pairs = await svc.list_trading_pairs(include_inactive=include_inactive)
     return [AdminTradingPairResponse.model_validate(p) for p in pairs]
 
 

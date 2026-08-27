@@ -129,6 +129,25 @@ async def publish_orderbook_update(
     return await redis.publish(channel, payload)
 
 
+async def publish_stops_changed(
+    redis: Redis,
+    symbol: str,
+) -> int:
+    """Notify public subscribers that the conditional-order ladder changed.
+
+    Published into the shared orderbook channel, so every client already
+    subscribed to /ws/orderbook/{symbol} receives it without any WS-routing
+    changes. The event carries no payload — clients are expected to refetch
+    the aggregated stop ladder via GET /api/v1/market/{symbol}/stops.
+
+    Call sites: stop placement (order_service), stop cancel (order_service),
+    stop trigger / trailing drift (stop_monitor_service).
+    """
+    channel = orderbook_channel(symbol)
+    payload = _envelope("stops_changed", {"symbol": symbol})
+    return await redis.publish(channel, payload)
+
+
 async def publish_trade(
     redis: Redis,
     symbol: str,
@@ -142,6 +161,9 @@ async def publish_trade(
     """Publish a trade print to the public trades channel.
 
     `side` is the taker side ("buy" or "sell").
+    ``ts`` is epoch MILLISECONDS (UTC-based) — the canonical timestamp
+    contract shared with the public-trades REST endpoint, so both feed
+    sources render identically on the client.
     """
     channel = trades_channel(symbol)
     data: dict[str, Any] = {
@@ -150,6 +172,7 @@ async def publish_trade(
         "price": price,
         "quantity": quantity,
         "side": side,
+        "ts": int(time.time() * 1000),
     }
     if taker_order_id is not None:
         data["taker_order_id"] = taker_order_id
@@ -390,6 +413,7 @@ __all__ = [
     "balances_channel", "bulk_channel",
     # Publishers
     "publish_orderbook_snapshot", "publish_orderbook_update",
+    "publish_stops_changed",
     "publish_trade", "publish_order_update", "publish_balance_update",
     "publish_bulk_result", "publish_sl_tp_activated",
     # Subscribers

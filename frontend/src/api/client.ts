@@ -51,9 +51,13 @@ async function request<T>(
   path: string,
   body?: unknown,
   params?: Record<string, string | number | undefined>,
+  options?: { auth?: boolean },
 ): Promise<T> {
-  const creds = getStoredCredentials();
-  if (!creds) {
+  const authRequired = options?.auth !== false;
+  // Public endpoints work without stored credentials and are called without
+  // HMAC headers at all.
+  const creds = authRequired ? getStoredCredentials() : null;
+  if (authRequired && !creds) {
     throw new ApiError(401, "not_authenticated", "No API credentials stored. Please log in.");
   }
 
@@ -69,7 +73,11 @@ async function request<T>(
   }
 
   const bodyStr = body ? JSON.stringify(body) : "";
-  const headers = await buildAuthHeaders(creds.apiKey, creds.apiSecret, method, fullPath, bodyStr);
+  const headers: Record<string, string> = {};
+  if (creds) {
+    const authHeaders = await buildAuthHeaders(creds.apiKey, creds.apiSecret, method, fullPath, bodyStr);
+    Object.assign(headers, authHeaders);
+  }
 
   const resp = await fetch(`${API_BASE}${fullPath}`, {
     method,
@@ -111,4 +119,10 @@ export const api = {
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   delete: <T>(path: string, body?: unknown) => request<T>("DELETE", path, body),
+};
+
+/** Anonymous-fetch client for public market-data endpoints. */
+export const publicApi = {
+  get: <T>(path: string, params?: Record<string, string | number | undefined>) =>
+    request<T>("GET", path, undefined, params, { auth: false }),
 };

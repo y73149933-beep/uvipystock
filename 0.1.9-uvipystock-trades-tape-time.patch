@@ -1,0 +1,307 @@
+diff --git a/backend/app/api/v1/trades.py b/backend/app/api/v1/trades.py
+index c77ffd9..b3448ea 100755
+--- a/backend/app/api/v1/trades.py
++++ b/backend/app/api/v1/trades.py
+@@ -1,7 +1,7 @@
+ """Trade history REST endpoints."""
+ from __future__ import annotations
+ 
+-from datetime import datetime, timedelta, timezone
++from datetime import UTC, datetime, timedelta, timezone
+ from decimal import Decimal
+ 
+ from fastapi import APIRouter, Depends, Query, Request
+@@ -16,6 +16,28 @@ from app.schemas.trade import TradeListResponse, TradeResponse
+ router = APIRouter(prefix="/trades", tags=["trades"])
+ 
+ 
++def _trade_to_public(t: Trade) -> dict:
++    """Serialize a Trade row into the public-feed contract.
++
++    ``ts`` is epoch MILLISECONDS (canonical client-side unit, shared with
++    WS trade prints). Naive datetimes (possible from SQLite test doubles)
++    are interpreted as UTC; PostgreSQL's timestamptz returns aware values
++    that keep their offset.
++    """
++    executed = t.executed_at
++    if executed.tzinfo is None:
++        executed = executed.replace(tzinfo=UTC)
++    return {
++        "trade_id": t.id,
++        "symbol": t.symbol,
++        "price": float(t.price),
++        "quantity": float(t.quantity),
++        "side": t.side.value,
++        "ts": int(executed.timestamp() * 1000),
++    }
++
++
++
+ @router.get(
+     "",
+     response_model=TradeListResponse,
+@@ -92,19 +114,7 @@ async def list_public_trades(
+     """
+     repo = TradeRepository(session)
+     trades = await repo.list_recent_by_symbol(symbol, limit=limit)
+-    return {
+-        "trades": [
+-            {
+-                "trade_id": t.id,
+-                "symbol": t.symbol,
+-                "price": float(t.price),
+-                "quantity": float(t.quantity),
+-                "side": t.side.value,
+-                "ts": int(t.executed_at.timestamp() * 1000),  # ms
+-            }
+-            for t in reversed(trades)  # most recent first
+-        ],
+-    }
++    return {"trades": [_trade_to_public(t) for t in reversed(trades)]}
+ 
+ 
+ @router.get(
+diff --git a/backend/app/redis_client/pubsub.py b/backend/app/redis_client/pubsub.py
+index debdc0f..8fb97b1 100755
+--- a/backend/app/redis_client/pubsub.py
++++ b/backend/app/redis_client/pubsub.py
+@@ -161,6 +161,9 @@ async def publish_trade(
+     """Publish a trade print to the public trades channel.
+ 
+     `side` is the taker side ("buy" or "sell").
++    ``ts`` is epoch MILLISECONDS (UTC-based) — the canonical timestamp
++    contract shared with the public-trades REST endpoint, so both feed
++    sources render identically on the client.
+     """
+     channel = trades_channel(symbol)
+     data: dict[str, Any] = {
+@@ -169,6 +172,7 @@ async def publish_trade(
+         "price": price,
+         "quantity": quantity,
+         "side": side,
++        "ts": int(time.time() * 1000),
+     }
+     if taker_order_id is not None:
+         data["taker_order_id"] = taker_order_id
+diff --git a/backend/app/ws/public.py b/backend/app/ws/public.py
+index eb882b3..7dd8679 100755
+--- a/backend/app/ws/public.py
++++ b/backend/app/ws/public.py
+@@ -15,6 +15,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import logging
++import time
+ 
+ from fastapi import WebSocket, WebSocketDisconnect
+ 
+@@ -39,7 +40,9 @@ async def handle_public_orderbook(websocket: WebSocket, symbol: str) -> None:
+             "bids": [[p, q] for p, q in snap["bids"]],
+             "asks": [[p, q] for p, q in snap["asks"]],
+             "last_trade_price": None,
+-            "ts": int(asyncio.get_event_loop().time() * 1000),
++            # epoch milliseconds — NOT asyncio loop time (monotonic, not a
++            # wall-clock value; clients would render nonsense dates)
++            "ts": int(time.time() * 1000),
+         }
+         await websocket.send_json(snapshot_msg)
+         logger.info("Sent initial snapshot for %s: %d bids, %d asks",
+@@ -89,7 +92,7 @@ async def handle_public_orderbook(websocket: WebSocket, symbol: str) -> None:
+                 if msg.get("action") == "ping":
+                     await websocket.send_json({
+                         "event": "pong",
+-                        "ts": int(asyncio.get_event_loop().time() * 1000),
++                        "ts": int(time.time() * 1000),
+                     })
+             except asyncio.TimeoutError:
+                 pass  # No client message, continue
+diff --git a/backend/tests/unit/test_trade_time_contract.py b/backend/tests/unit/test_trade_time_contract.py
+new file mode 100644
+index 0000000..b497956
+--- /dev/null
++++ b/backend/tests/unit/test_trade_time_contract.py
+@@ -0,0 +1,141 @@
++"""Contract tests for the trade-tape time pipeline.
++
++Locked-down bug: the trades feed rendered clock values shifted by hours.
++Root causes fixed together:
++
++* ``pubsub.publish_trade`` sent NO timestamp — live WS prints fell back
++  to garbage on the client;
++* REST public trades emit epoch-ms, but the client formatter read
++  seconds (unit mismatch across the two feed sources);
++* WS snapshot/pong stamps used ``asyncio`` monotonic loop time instead
++  of wall-clock epoch ms.
++
++Canonical contract asserted here:
++
++* every live print carries ``ts`` as an INTEGER in epoch MILLISECONDS;
++* REST serialization (``_trade_to_public``) produces the SAME unit and
++  interprets naive datetimes as UTC (SQLite doubles), aware datetimes
++  keep their offset.
++"""
++from __future__ import annotations
++
++import json
++import sys
++import time
++from datetime import UTC, datetime, timedelta, timezone
++from decimal import Decimal
++from pathlib import Path
++
++import pytest_asyncio
++from fakeredis.aioredis import FakeRedis
++
++_BACKEND = Path(__file__).resolve().parents[2]
++if str(_BACKEND) not in sys.path:
++    sys.path.insert(0, str(_BACKEND))
++
++SYM = "BTC/USD"
++
++
++class _SpyRedis(FakeRedis):
++    """FakeRedis that records published channel payloads."""
++
++    def __init__(self, *a, **k):
++        super().__init__(*a, decode_responses=True, **k)
++        self.published: list[tuple[str, str]] = []
++
++    async def publish(self, channel, message, *args, **kwargs):
++        self.published.append(
++            (channel, message.decode() if isinstance(message, bytes) else message)
++        )
++        return 1
++
++
++@pytest_asyncio.fixture
++async def spy_redis():
++    r = _SpyRedis()
++    yield r
++    await r.flushall()
++
++
++# ─── WS live prints ──────────────────────────────────────────────────────────
++
++async def test_publish_trade_carries_epoch_ms_ts(spy_redis):
++    from app.redis_client import pubsub
++
++    before_ms = int(time.time() * 1000) - 5000
++    await pubsub.publish_trade(
++        spy_redis, SYM, trade_id=42,
++        price=100.5, quantity=2.0, side="buy",
++        taker_order_id=1, maker_order_id=2,
++    )
++    after_ms = int(time.time() * 1000) + 5000
++
++    assert len(spy_redis.published) == 1
++    ch, raw = spy_redis.published[0]
++    assert ch == pubsub.trades_channel(SYM)
++
++    msg = json.loads(raw)
++    assert msg["event"] == "trade"
++    assert msg["trade_id"] == 42
++
++    ts = msg["ts"]
++    assert isinstance(ts, int), "ts must be an integer"
++    assert ts > 10**12, "ts must be epoch MILLISECONDS, not seconds"
++    assert before_ms <= ts <= after_ms
++
++
++async def test_publish_trade_payload_keys_stable(spy_redis):
++    """Existing consumers (worker relay, client store) rely on these keys."""
++    from app.redis_client import pubsub
++
++    await pubsub.publish_trade(spy_redis, SYM, trade_id=7,
++                               price=1.0, quantity=1.0, side="sell")
++    msg = json.loads(spy_redis.published[0][1])
++    for key in ("symbol", "trade_id", "price", "quantity", "side", "ts"):
++        assert key in msg
++
++
++# ─── REST serialization ──────────────────────────────────────────────────────
++
++class _Row:
++    """Duck-typed Trade row for _trade_to_public."""
++
++    def __init__(self, executed_at: datetime):
++        self.id = 11
++        self.symbol = SYM
++        self.price = Decimal("100.25")
++        self.quantity = Decimal("3")
++        self.side = type("S", (), {"value": "buy"})()
++
++        self.executed_at = executed_at
++
++
++def _expected_ms(dt_aware: datetime) -> int:
++    return int(dt_aware.timestamp() * 1000)
++
++
++def test_rest_serialization_naive_datetime_treated_as_utc():
++    from app.api.v1.trades import _trade_to_public
++
++    naive = datetime(2026, 8, 27, 2, 30, 0)          # no tzinfo (sqlite-like)
++    out = _trade_to_public(_Row(naive))
++
++    expected = _expected_ms(naive.replace(tzinfo=UTC))
++    assert out["ts"] == expected
++    assert out["ts"] > 10**12
++    assert out["trade_id"] == 11
++    assert out["side"] == "buy"
++
++
++def test_rest_serialization_aware_datetime_keeps_instant():
++    from app.api.v1.trades import _trade_to_public
++
++    aware = datetime(2026, 8, 27, 9, 30, 0, tzinfo=UTC)
++    out = _trade_to_public(_Row(aware))
++    assert out["ts"] == _expected_ms(aware)
++
++    # Equivalent instant expressed in a non-UTC offset serializes identically.
++    from datetime import timedelta as _td
++    kras = timezone(_td(hours=7))
++    same_moment = datetime(2026, 8, 27, 16, 30, 0, tzinfo=kras)   # == 09:30Z
++    assert _trade_to_public(_Row(same_moment))["ts"] == out["ts"]
+diff --git a/frontend/src/lib/format.ts b/frontend/src/lib/format.ts
+index 6c7c600..9dacab5 100755
+--- a/frontend/src/lib/format.ts
++++ b/frontend/src/lib/format.ts
+@@ -53,10 +53,21 @@ export function formatPct(value: number, decimals: number = 2): string {
+ }
+ 
+ /**
+- * Format a timestamp (ISO string or unix seconds) as HH:MM:SS.
++ * Format a timestamp as HH:MM:SS (browser-local timezone).
++ *
++ * Canonical backend contract is epoch MILLISECONDS; values below 1e11 are
++ * treated as unix SECONDS for backwards compatibility with older payloads.
++ * ISO strings pass straight through to Date parsing.
+  */
+ export function formatTime(ts: string | number): string {
+-  const date = typeof ts === "number" ? new Date(ts * 1000) : new Date(ts);
++  if (ts === undefined || ts === null || ts === "") return "—";
++  let date: Date;
++  if (typeof ts === "number") {
++    date = new Date(ts < 1e11 ? ts * 1000 : ts);
++  } else {
++    date = new Date(ts);
++  }
++  if (isNaN(date.getTime())) return "—";
+   return date.toLocaleTimeString("en-US", { hour12: false });
+ }
+ 
+diff --git a/frontend/src/store/tradesStore.ts b/frontend/src/store/tradesStore.ts
+index 927c397..f6fd6fd 100755
+--- a/frontend/src/store/tradesStore.ts
++++ b/frontend/src/store/tradesStore.ts
+@@ -50,7 +50,9 @@ export const useTradesStore = create<TradesState>((set) => ({
+         price: msg.price,
+         quantity: msg.quantity,
+         side: msg.side,
+-        ts: msg.ts,
++        // Legacy backend prints carry no ts — fall back to arrival time so
++        // the feed never renders an invalid clock value.
++        ts: typeof msg.ts === "number" ? msg.ts : Date.now(),
+       };
+       const next = [entry, ...state.recentTrades].slice(0, MAX_RECENT);
+       saveToStorage(next);

@@ -66,7 +66,7 @@ from app.redis_client import get_redis
 from app.redis_client import orderbook, orders_index, queues, pubsub
 from app.repositories.order_repo import OrderRepository
 from app.repositories.trading_pair_repo import TradingPairRepository
-from app.services.trade_service import TradeService
+from app.services.trade_service import TradeService, TakerOrderInvalidError
 
 logger = logging.getLogger(__name__)
 _settings = get_settings()
@@ -270,7 +270,11 @@ class MatchingWorker:
                 order_id=mo["order_id"],
                 side=1 if mo["side"] == "sell" else 0,  # C_SELL=1, C_BUY=0
                 price=mo["price"],
-                qty=mo["visible_quantity"] if mo["is_iceberg"] else mo["quantity"],
+                # Feed the FULL remaining quantity: engine refills the visible
+                # chunk from it as fills proceed. Passing only visible_quantity
+                # made iceberg hidden volume untradable (order died after the
+                # first chunk with funds still locked).
+                qty=mo["quantity"],
                 is_iceberg=mo["is_iceberg"],
                 visible_qty=mo["visible_quantity"],
                 hidden_qty=mo["hidden_quantity"],
@@ -317,38 +321,49 @@ class MatchingWorker:
             )
             return result
 
-        # 6. Persist trades + update balances in a single PG transaction
+        # 6. Persist trades + update balances in a single PG transaction.
+        # A TakerOrderInvalidError means the taker row is gone/unmatchable
+        # (phantom place after rollback, duplicate delivery after cancel):
+        # settlement is refused INSIDE TradeService, so we must not continue
+        # to refund/rest the taker — just record and bail out.
         if trades:
-            async with async_session_factory() as session:
-                async with session.begin():
-                    # Load trading pair to get base/quote assets
-                    pair_repo = TradingPairRepository(session)
-                    pair = await pair_repo.get_by_symbol(payload.symbol)
-                    if pair is None:
-                        logger.error("Trading pair %s not found for match", payload.symbol)
-                        return result
+            try:
+                async with async_session_factory() as session:
+                    async with session.begin():
+                        # Load trading pair to get base/quote assets
+                        pair_repo = TradingPairRepository(session)
+                        pair = await pair_repo.get_by_symbol(payload.symbol)
+                        if pair is None:
+                            logger.error("Trading pair %s not found for match", payload.symbol)
+                            return result
 
-                    # Convert trades to domain dicts with maker_user_id
-                    # We need to load maker order user_ids — do it via Redis HASHes
-                    enriched_trades = []
-                    for t in trades:
-                        maker_hash = await orderbook.get_order_hash(redis, t["maker_order_id"])
-                        maker_user_id = int(maker_hash.get("user_id", "0")) if maker_hash else 0
-                        enriched_t = trade_dict_to_domain(t, payload.symbol)
-                        enriched_t["maker_user_id"] = maker_user_id
-                        enriched_trades.append(enriched_t)
+                        # Convert trades to domain dicts with maker_user_id
+                        # We need to load maker order user_ids — do it via Redis HASHes
+                        enriched_trades = []
+                        for t in trades:
+                            maker_hash = await orderbook.get_order_hash(redis, t["maker_order_id"])
+                            maker_user_id = int(maker_hash.get("user_id", "0")) if maker_hash else 0
+                            enriched_t = trade_dict_to_domain(t, payload.symbol)
+                            enriched_t["maker_user_id"] = maker_user_id
+                            enriched_trades.append(enriched_t)
 
-                    trade_svc = TradeService(session)
-                    await trade_svc.persist_trade_batch(
-                        trades=enriched_trades,
-                        taker_user_id=payload.user_id,
-                        taker_order_id=payload.order_id,
-                        taker_side=OrderSide(payload.side),
-                        taker_type=OrderType(payload.type),
-                        symbol=payload.symbol,
-                        base_asset=pair.base_asset,
-                        quote_asset=pair.quote_asset,
-                    )
+                        trade_svc = TradeService(session)
+                        await trade_svc.persist_trade_batch(
+                            trades=enriched_trades,
+                            taker_user_id=payload.user_id,
+                            taker_order_id=payload.order_id,
+                            taker_side=OrderSide(payload.side),
+                            taker_type=OrderType(payload.type),
+                            symbol=payload.symbol,
+                            base_asset=pair.base_asset,
+                            quote_asset=pair.quote_asset,
+                        )
+            except TakerOrderInvalidError as e:
+                logger.error(
+                    "Match for taker %d refused: %s — skipping refund/rest",
+                    payload.order_id, e,
+                )
+                return result
 
         # 7. If taker has remaining qty and is LIMIT/POST_ONLY/ICEBERG → insert as resting
         if remaining > 0 and payload.type in ("limit", "post_only", "iceberg"):
@@ -373,11 +388,17 @@ class MatchingWorker:
         return result
 
     async def _insert_resting_taker(self, payload: OrderActionPayload, remaining: float) -> None:
-        """Insert a partially-filled taker as a new resting order in the book."""
+        """Insert a partially-filled taker as a new resting order in the book.
+
+        CRITICAL: the HASH's `quantity` MUST be the REMAINING quantity, not
+        the original one. The next match loads `quantity` from this HASH as
+        the maker volume — storing the original made a partially-filled
+        order return to the book at its FULL size → over-execution →
+        settle ValueError → the whole trade batch dead-lettered.
+        """
         redis = self._redis
-        # Compute the lock amount for the remaining (it's already locked at placement)
-        # The order is already in PG with status PARTIALLY_FILLED.
-        # We just need to add it to the Redis book + indexes.
+        # The lock for the remaining part is already held (locked_amount on
+        # the order row covers it — settlement decremented filled portions).
         metadata = {
             "order_id": str(payload.order_id),
             "user_id": str(payload.user_id),
@@ -385,7 +406,7 @@ class MatchingWorker:
             "side": payload.side,
             "type": payload.type,
             "price": str(payload.price) if payload.price else "",
-            "quantity": str(payload.quantity),
+            "quantity": str(remaining),  # ← remaining, NOT payload.quantity
             "visible_quantity": str(payload.visible_qty) if payload.is_iceberg else str(remaining),
             "hidden_quantity": str(payload.hidden_qty) if payload.is_iceberg else "",
             "is_iceberg": "1" if payload.is_iceberg else "0",
@@ -405,17 +426,18 @@ class MatchingWorker:
     async def _refund_market_buy_leftover(
         self, payload: OrderActionPayload, remaining_qty: float,
     ) -> None:
-        """Refund unused locked quote asset after a buy order.
+        """Refund unused locked quote asset after a fully-executed buy order.
 
         Works for both market and limit buy orders:
-        - Market buy: locks worst-case (walk-the-book * 1.001), actual
-          cost may be less → refund difference
-        - Limit buy (fully filled): locks limit_price * qty, but if
-          executed at a better price, the savings remain locked
+        - Market buy: locks worst-case (walk-the-book * 1.001), actual cost
+          is usually less → refund difference
+        - Limit buy (fully filled): if executed at a better price than the
+          limit, the savings are refunded here
 
-        The settle operation already deducted the actual trade cost from
-        locked. Whatever remains in locked is the unused buffer →
-        unlock it back to available.
+        Scope fix: refunds EXACTLY this order's residual reservation
+        (`orders.locked_amount` minus what settlement consumed), instead of
+        unlocking the user's ENTIRE quote locked_balance — the old behavior
+        stole concurrent orders' collateral when several buys were in flight.
         """
         from app.db.session import async_session_factory
         from app.services.balance_service import BalanceService
@@ -432,19 +454,32 @@ class MatchingWorker:
                     return
 
                 quote_asset = pair.quote_asset
+
+                # The order row is authoritative for how much of the user's
+                # locked balance belongs to THIS order.
+                order_repo = OrderRepository(session)
+                order_row = await order_repo.get_for_update(payload.order_id)
+                if order_row is None:
+                    logger.warning(
+                        "Order %d gone before refund — nothing to release",
+                        payload.order_id,
+                    )
+                    return
+
+                reserved = Decimal(str(order_row.locked_amount or "0"))
+
                 bal_repo = BalanceRepository(session)
                 balance = await bal_repo.get_for_update(payload.user_id, quote_asset)
-
                 if balance is None:
                     logger.warning("No %s balance for user %d — nothing to refund",
                                    quote_asset, payload.user_id)
                     return
 
-                leftover = balance.locked_balance
+                leftover = min(reserved, balance.locked_balance)
                 if leftover > 0:
                     logger.info(
-                        "Refunding market buy leftover: user=%d %s locked=%s → available",
-                        payload.user_id, quote_asset, leftover,
+                        "Refunding buy leftover for order %d: user=%d %s amount=%s → available",
+                        payload.order_id, payload.user_id, quote_asset, leftover,
                     )
                     balance_svc = BalanceService(session)
                     await balance_svc.unlock_pessimistic(
@@ -452,10 +487,13 @@ class MatchingWorker:
                         reason="market_buy_refund",
                         order_id=payload.order_id,
                     )
+                    # Keep the per-order ledger consistent with the unlock.
+                    order_row.locked_amount = (order_row.locked_amount or Decimal("0")) - leftover
+                    order_row.version += 1
                 else:
                     logger.debug(
-                        "No leftover to refund for market buy %d (user=%d %s locked=0)",
-                        payload.order_id, payload.user_id, quote_asset,
+                        "No leftover to refund for buy %d (user=%d %s reserved=%s)",
+                        payload.order_id, payload.user_id, quote_asset, reserved,
                     )
 
     async def _publish_orderbook_delta(self, symbol: str) -> None:
@@ -487,13 +525,22 @@ class MatchingWorker:
     # ─── MODIFY (Cancel-Replace) ────────────────────────────────────────────
 
     async def _handle_modify(self, payload: OrderActionPayload) -> dict[str, Any]:
-        """Handle a modify action: the order service has already done Cancel-Replace.
+        """Handle a modify action by running the full place pipeline.
 
-        The new order (with replaces_id = old) is enqueued as a 'place' action
-        separately. This handler is for cleanup of the old order in any
-        in-flight match pipelines.
+        OrderService.cancel-replace already created the NEW order row and
+        canceled the old one; the payload carries the NEW order id. Feeding
+        it through `_handle_place` gives modify parity with placement
+        (match → settle → rest remainder). Previously this handler only
+        ack'ed — the new order stayed status=NEW forever, invisible to
+        matching while its funds stayed locked.
         """
-        return {"action": "modify", "order_id": payload.order_id, "outcome": "ok"}
+        logger.info(
+            "Processing modify as re-place: old=%s new=%d",
+            payload.replaces_id, payload.order_id,
+        )
+        result = await self._handle_place(payload)
+        result["action"] = "modify"
+        return result
 
 
 # ─── Module-level entry point ────────────────────────────────────────────────

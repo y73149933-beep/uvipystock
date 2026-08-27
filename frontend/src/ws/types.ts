@@ -3,6 +3,7 @@
 export type WSEventType =
   | "orderbook_snapshot"
   | "orderbook_update"
+  | "stops_changed"
   | "trade"
   | "order"
   | "balance"
@@ -38,6 +39,11 @@ export interface OrderBookUpdateMsg extends WSMessageBase {
   event: "orderbook_update";
   symbol: string;
   changes: OrderBookChange[];
+}
+
+export interface StopsChangedMsg extends WSMessageBase {
+  event: "stops_changed";
+  symbol: string;
 }
 
 export interface TradePrintMsg extends WSMessageBase {
@@ -89,6 +95,7 @@ export interface BulkResultMsg extends WSMessageBase {
 export type WSMessage =
   | OrderBookSnapshotMsg
   | OrderBookUpdateMsg
+  | StopsChangedMsg
   | TradePrintMsg
   | OrderUpdateMsg
   | BalanceUpdateMsg

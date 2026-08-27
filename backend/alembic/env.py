@@ -14,6 +14,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+from sqlalchemy.engine import make_url
 
 # ─── Alembic config objects ──────────────────────────────────────────────────
 config = context.config
@@ -75,6 +76,15 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
+def _describe_db_target() -> str:
+    """Masked connection string for error messages (password hidden)."""
+    try:
+        url = make_url(config.get_main_option("sqlalchemy.url"))
+        return url.render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the real error
+        return "<unparseable sqlalchemy.url>"
+
+
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode using an async engine."""
     connectable = async_engine_from_config(
@@ -84,10 +94,26 @@ async def run_async_migrations() -> None:
         future=True,
     )
 
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
+    try:
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+    except OSError as exc:
+        # socket.gaierror (-2 "Name or service not known"), ConnectionRefused, etc.
+        # → infrastructure-level failure: fail fast with actionable hints instead
+        # of a raw asyncpg traceback.
+        raise RuntimeError(
+            f"Cannot connect to PostgreSQL. Target: {_describe_db_target()}\n"
+            "Hints:\n"
+            "  1) Is the DB container up and healthy?   -> docker compose ps postgres\n"
+            "     (Docker DNS resolves service aliases only for RUNNING containers)\n"
+            "  2) Does 'backend' resolve the DB host?   -> "
+            "docker compose exec backend getent hosts postgres\n"
+            "  3) Are DATABASE_URL / POSTGRES_HOST set to the compose SERVICE name,\n"
+            "     and were both services raised by the same 'docker compose up'?\n"
+            f"Original error: {exc!r}"
+        ) from exc
+    finally:
+        await connectable.dispose()
 
 
 def run_migrations_online() -> None:

@@ -135,6 +135,7 @@ async def test_app(monkeypatch):
                 filled_quote_qty NUMERIC(36,18) DEFAULT 0 NOT NULL,
                 visible_quantity NUMERIC(36,18),
                 hidden_quantity NUMERIC(36,18),
+                locked_amount NUMERIC(36,18) DEFAULT 0 NOT NULL,
                 replace_count INTEGER DEFAULT 0 NOT NULL,
                 replaces_id INTEGER,
                 replaced_by_id INTEGER,

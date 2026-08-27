@@ -50,7 +50,9 @@ export const useTradesStore = create<TradesState>((set) => ({
         price: msg.price,
         quantity: msg.quantity,
         side: msg.side,
-        ts: msg.ts,
+        // Legacy backend prints carry no ts — fall back to arrival time so
+        // the feed never renders an invalid clock value.
+        ts: typeof msg.ts === "number" ? msg.ts : Date.now(),
       };
       const next = [entry, ...state.recentTrades].slice(0, MAX_RECENT);
       saveToStorage(next);

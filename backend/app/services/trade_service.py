@@ -31,6 +31,17 @@ from app.services.balance_service import BalanceService
 logger = logging.getLogger(__name__)
 
 
+class TakerOrderInvalidError(Exception):
+    """Raised when a match batch references a missing/invalid taker order.
+
+    This happens when a placement action reaches the worker but its PG
+    transaction was rolled back afterward (phantom place), or when a duplicate
+    delivery races a cancel. Settling makers against such a taker would
+    credit counterparties without anyone paying (money printing), so the
+    whole batch is refused instead.
+    """
+
+
 class TradeService:
     """Persist trades and update balances + orders atomically."""
 
@@ -40,6 +51,9 @@ class TradeService:
         self.order_repo = OrderRepository(session)
         self.balance_repo = BalanceRepository(session)
         self.balance_svc = BalanceService(session)
+
+    # Statuses of an order that may still absorb fills from a match.
+    _MATCHABLE = (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
 
     async def persist_trade_batch(
         self,
@@ -73,25 +87,101 @@ class TradeService:
           - Maker: credit base
 
         Returns the list of persisted Trade objects.
+        Raises :class:`TakerOrderInvalidError` if the taker gate fails.
         """
         if not trades:
             return []
 
-        persisted: list[Trade] = []
         redis = get_redis()
 
-        # Aggregate per-order fill deltas for batched updates
-        maker_fill_deltas: dict[int, tuple[Decimal, Decimal]] = {}  # order_id → (qty, quote_qty)
-        taker_total_qty = Decimal("0")
-        taker_total_quote = Decimal("0")
-
+        # ── Phase 1: aggregate raw fill deltas per maker ────────────────────
+        raw_maker_deltas: dict[int, tuple[Decimal, Decimal]] = {}  # id → (qty, quote)
+        taker_qty_total_preview = Decimal("0")
         for trade_dict in trades:
             maker_id = int(trade_dict["maker_order_id"])
             price = Decimal(str(trade_dict["price"]))
             qty = Decimal(str(trade_dict["quantity"]))
             quote_qty = price * qty
 
-            # Insert Trade row
+            if maker_id in raw_maker_deltas:
+                prev_qty, prev_quote = raw_maker_deltas[maker_id]
+                raw_maker_deltas[maker_id] = (prev_qty + qty, prev_quote + quote_qty)
+            else:
+                raw_maker_deltas[maker_id] = (qty, quote_qty)
+            taker_qty_total_preview += qty
+
+        # ── Phase 2: lock involved rows FIRST, then validate ────────────────
+        maker_orders: dict[int, Any] = {}
+        for maker_id in raw_maker_deltas:
+            mo = await self.order_repo.get_for_update(maker_id)
+            if mo is not None:
+                maker_orders[maker_id] = mo
+
+        taker_order = await self.order_repo.get_for_update(taker_order_id)
+
+        # Taker gate — refuse the batch rather than print money.
+        if (
+            taker_order is None
+            or taker_order.status not in self._MATCHABLE
+            or taker_order.user_id != taker_user_id
+        ):
+            raise TakerOrderInvalidError(
+                f"taker order {taker_order_id} "
+                f"(status={taker_order.status.value if taker_order else 'MISSING'}) "
+                f"cannot absorb fills — refusing {len(trades)} trade(s)"
+            )
+
+        # Taker overfill guard: a replayed delivery must not double-count.
+        if taker_order.remaining_quantity < taker_qty_total_preview - Decimal("1e-12"):
+            raise TakerOrderInvalidError(
+                f"taker order {taker_order_id}: batch qty {taker_qty_total_preview} "
+                f"exceeds remaining {taker_order.remaining_quantity}"
+            )
+
+        # ── Phase 3: filter invalid makers out of the trade list ────────────
+        # Epsilon tolerates double↔decimal round-trip noise from the matcher.
+        _EPS = Decimal("1e-12")
+        valid_trades: list[dict[str, Any]] = []
+        for trade_dict in trades:
+            maker_id = int(trade_dict["maker_order_id"])
+            qty = Decimal(str(trade_dict["quantity"]))
+            mo = maker_orders.get(maker_id)
+
+            if mo is None:
+                await self._drop_stale_maker(redis, maker_id,
+                                             "PG row missing (ghost book entry)")
+                continue
+            if mo.status not in self._MATCHABLE:
+                logger.warning(
+                    "Dropping trade: maker %d in non-matchable status %s",
+                    maker_id, mo.status.value,
+                )
+                continue
+            if mo.remaining_quantity < qty - _EPS:
+                logger.warning(
+                    "Dropping trade: maker %d overfill %s > remaining %s",
+                    maker_id, qty, mo.remaining_quantity,
+                )
+                continue
+
+            valid_trades.append(trade_dict)
+
+        if not valid_trades:
+            logger.error("All %d trades dropped by maker gates", len(trades))
+            return []
+
+        # ── Phase 4: persist the valid subset ────────────────────────────────
+        maker_fill_deltas: dict[int, tuple[Decimal, Decimal]] = {}
+        taker_total_qty = Decimal("0")
+        taker_total_quote = Decimal("0")
+
+        persisted: list[Trade] = []
+        for trade_dict in valid_trades:
+            maker_id = int(trade_dict["maker_order_id"])
+            price = Decimal(str(trade_dict["price"]))
+            qty = Decimal(str(trade_dict["quantity"]))
+            quote_qty = price * qty
+
             trade = Trade(
                 taker_order_id=taker_order_id,
                 maker_order_id=maker_id,
@@ -101,14 +191,13 @@ class TradeService:
                 quote_quantity=quote_qty,
                 side=taker_side,
                 taker_user_id=taker_user_id,
-                maker_user_id=int(trade_dict.get("maker_user_id", 0)),  # set below
+                maker_user_id=maker_orders[maker_id].user_id,
                 taker_fee=Decimal("0"),   # TODO: compute from pair fees
                 maker_fee=Decimal("0"),
             )
             self.session.add(trade)
             persisted.append(trade)
 
-            # Accumulate maker fill delta
             if maker_id in maker_fill_deltas:
                 prev_qty, prev_quote = maker_fill_deltas[maker_id]
                 maker_fill_deltas[maker_id] = (prev_qty + qty, prev_quote + quote_qty)
@@ -120,23 +209,20 @@ class TradeService:
 
         await self.session.flush()
 
-        # Load all involved orders + balances with FOR UPDATE (pessimistic)
-        maker_orders: dict[int, Any] = {}
-        for maker_id in maker_fill_deltas:
-            mo = await self.order_repo.get_for_update(maker_id)
-            if mo is not None:
-                maker_orders[maker_id] = mo
-
-        taker_order = await self.order_repo.get_for_update(taker_order_id)
-
         # Update maker orders + settle balances
         for maker_id, (qty_delta, quote_delta) in maker_fill_deltas.items():
-            mo = maker_orders.get(maker_id)
-            if mo is None:
-                continue
+            mo = maker_orders[maker_id]
 
             mo.filled_quantity += qty_delta
             mo.filled_quote_qty += quote_delta
+            # Decrement this maker's own reservation by exactly what the trade
+            # consumed from its lock (base for sells, quote for buys). Keeps
+            # locked_amount authoritative for later cancel/modify refunds.
+            mo.locked_amount = max(
+                (mo.locked_amount or Decimal("0"))
+                - (qty_delta if mo.side == OrderSide.SELL else quote_delta),
+                Decimal("0"),
+            )
             mo.version += 1
 
             # Determine maker status
@@ -144,11 +230,6 @@ class TradeService:
                 mo.status = OrderStatus.FILLED
             else:
                 mo.status = OrderStatus.PARTIALLY_FILLED
-
-            # Set the maker_user_id on the Trade rows (now that we have the order)
-            for t in persisted:
-                if t.maker_order_id == maker_id:
-                    t.maker_user_id = mo.user_id
 
             # Balance flow
             await self._settle_trade_balances(
@@ -165,30 +246,35 @@ class TradeService:
             await self._update_redis_maker(redis, mo)
 
         # Update taker order
-        if taker_order is not None:
-            taker_order.filled_quantity += taker_total_qty
-            taker_order.filled_quote_qty += taker_total_quote
-            taker_order.version += 1
+        taker_order.filled_quantity += taker_total_qty
+        taker_order.filled_quote_qty += taker_total_quote
+        # Same per-order reservation accounting on the taker leg.
+        taker_order.locked_amount = max(
+            (taker_order.locked_amount or Decimal("0"))
+            - (taker_total_quote if taker_side == OrderSide.BUY else taker_total_qty),
+            Decimal("0"),
+        )
+        taker_order.version += 1
 
-            if taker_order.filled_quantity >= taker_order.quantity:
-                taker_order.status = OrderStatus.FILLED
-            elif taker_order.filled_quantity > 0:
-                taker_order.status = OrderStatus.PARTIALLY_FILLED
+        if taker_order.filled_quantity >= taker_order.quantity:
+            taker_order.status = OrderStatus.FILLED
+        elif taker_order.filled_quantity > 0:
+            taker_order.status = OrderStatus.PARTIALLY_FILLED
 
-            # Taker balance flow
-            await self._settle_trade_balances(
-                taker_side=taker_side,
-                is_taker=True,
-                taker_order=taker_order,
-                qty=taker_total_qty,
-                quote_qty=taker_total_quote,
-                base_asset=base_asset,
-                quote_asset=quote_asset,
-            )
+        # Taker balance flow
+        await self._settle_trade_balances(
+            taker_side=taker_side,
+            is_taker=True,
+            taker_order=taker_order,
+            qty=taker_total_qty,
+            quote_qty=taker_total_quote,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
 
-            # If taker is fully filled and has SL/TP children → activate them
-            if taker_order.status == OrderStatus.FILLED:
-                await self._activate_sltp_children(taker_order)
+        # If taker is fully filled and has SL/TP children → activate them
+        if taker_order.status == OrderStatus.FILLED:
+            await self._activate_sltp_children(taker_order)
 
         await self.session.flush()
 
@@ -227,6 +313,32 @@ class TradeService:
             )
 
         return persisted
+
+    async def _drop_stale_maker(self, redis, maker_id: int, reason: str) -> None:
+        """Best-effort removal of a maker book entry that cannot settle.
+
+        A trade referencing a non-existent PG row means the Redis ZSET/HASH
+        is a ghost left by a rolled-back placement. Removing it here keeps
+        the book self-healing instead of poisoning every future match.
+        Failures are swallowed — reconcile flows may clean up later.
+        """
+        logger.warning("Dropping stale maker %d from book: %s", maker_id, reason)
+        try:
+            h = await orderbook.get_order_hash(redis, maker_id)
+            if not h:
+                return
+            side = h.get("side", "buy")
+            price = Decimal(h.get("price") or "0")
+            await orderbook.remove_resting_order(
+                redis, maker_id, h.get("symbol", ""), side, price, 0,
+            )
+            await orderbook.delete_order_hash(redis, maker_id)
+            from app.redis_client import orders_index
+            uid = int(h.get("user_id") or 0)
+            if uid and h.get("symbol"):
+                await orders_index.remove_open_order(redis, uid, h["symbol"], maker_id)
+        except Exception as e:  # noqa: BLE001 — cleanup must never break settlement
+            logger.warning("Stale-maker cleanup for %d failed: %s", maker_id, e)
 
     async def _settle_trade_balances(
         self,
@@ -361,4 +473,7 @@ class TradeService:
             )
 
 
-__all__ = ["TradeService"]
+__all__ = [
+    "TradeService",
+    "TakerOrderInvalidError",
+]

@@ -27,3 +27,9 @@ class TradingPairRepository(BaseRepository[TradingPair]):
         stmt = select(TradingPair).where(TradingPair.is_active == True).order_by(TradingPair.symbol)  # noqa: E712
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def list_all(self) -> Sequence[TradingPair]:
+        """All trading pairs including soft-deleted (is_active=False) ones."""
+        stmt = select(TradingPair).order_by(TradingPair.symbol)
+        result = await self.session.execute(stmt)
+        return result.scalars().all()

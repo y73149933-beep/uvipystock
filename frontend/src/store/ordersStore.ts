@@ -67,7 +67,10 @@ export const useOrdersStore = create<OrdersState>((set, get) => ({
           ),
         };
       } else {
-        // New order (placed via WS event)
+        // New order (placed via WS event). NOTE: OrderUpdateMsg carries no
+        // stop_price — for conditional orders we optimistically insert the
+        // stub and immediately re-fetch from REST so the order book's yellow
+        // trigger markers appear without waiting for the 10s poll.
         const newOrder: Order = {
           id: orderId,
           user_id: 0,
@@ -95,6 +98,9 @@ export const useOrdersStore = create<OrdersState>((set, get) => ({
           created_at: new Date(msg.ts).toISOString(),
           updated_at: new Date(msg.ts).toISOString(),
         };
+        if (["stop_market", "stop_limit", "trailing_stop"].includes(newOrder.type)) {
+          void get().fetchOpenOrders();
+        }
         return { openOrders: [newOrder, ...state.openOrders] };
       }
     });

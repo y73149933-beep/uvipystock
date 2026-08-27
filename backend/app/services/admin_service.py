@@ -12,6 +12,7 @@ from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import DuplicateTradingPairHTTPError
 from app.models.api_key import ApiKey
 from app.models.balance import Balance
 from app.models.trading_pair import TradingPair
@@ -124,10 +125,39 @@ class AdminService:
         maker_fee_bps: Decimal = Decimal("0"),
         taker_fee_bps: Decimal = Decimal("0"),
     ) -> TradingPair:
-        """Create a new trading pair."""
+        """Create a trading pair, or reactivate a previously deactivated one.
+
+        The admin UI "removes" pairs by flipping ``is_active=False``
+        (soft delete — the row must survive because orders/trades hold FKs
+        to it, and the symbol column is UNIQUE). Therefore:
+
+        * symbol exists AND is_active=False → treat as re-create:
+          overwrite parameters with the new request body, set active;
+        * symbol exists AND is_active=True  → 409 DuplicateTradingPairHTTPError
+          (previously raised raw ValueError → unhandled 500).
+        """
         existing = await self.pair_repo.get_by_symbol(symbol)
+        if existing is not None and existing.is_active:
+            raise DuplicateTradingPairHTTPError(
+                f"Trading pair {symbol!r} already exists",
+            )
         if existing is not None:
-            raise ValueError(f"Trading pair {symbol!r} already exists")
+            logger.info("Reactivating soft-deleted trading pair %s (id=%s)", symbol, existing.id)
+            updated = await self.pair_repo.update(
+                existing.id,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                price_precision=price_precision,
+                quantity_precision=quantity_precision,
+                min_lot_size=min_lot_size,
+                max_lot_size=max_lot_size,
+                tick_size=tick_size,
+                maker_fee_bps=maker_fee_bps,
+                taker_fee_bps=taker_fee_bps,
+                is_active=True,
+            )
+            assert updated is not None  # row was just fetched — cannot disappear
+            return updated
 
         pair = await self.pair_repo.create(
             symbol=symbol,
@@ -148,7 +178,10 @@ class AdminService:
         """Activate or deactivate a trading pair."""
         return await self.pair_repo.update(pair_id, is_active=is_active)
 
-    async def list_trading_pairs(self) -> Sequence[TradingPair]:
+    async def list_trading_pairs(self, include_inactive: bool = False) -> Sequence[TradingPair]:
+        """List trading pairs; optionally include soft-deleted (inactive) ones."""
+        if include_inactive:
+            return await self.pair_repo.list_all()
         return await self.pair_repo.list_active()
 
     # ─── API key management ─────────────────────────────────────────────────

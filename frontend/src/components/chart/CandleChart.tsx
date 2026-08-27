@@ -3,6 +3,32 @@ import { createChart, ColorType, type IChartApi, type ISeriesApi, type UTCTimest
 import { useChartStore } from "@/store/chartStore";
 import { useOrderbookStore } from "@/store/orderbookStore";
 import { ChartToolbar } from "./ChartToolbar";
+import { DepthOverlay } from "./DepthOverlay";
+
+const DEPTH_PREFS_KEY = "uvity.depthOverlay";
+
+interface DepthPrefs {
+  book: boolean;
+  stops: boolean;
+  publicStops: boolean;
+}
+
+function loadDepthPrefs(): DepthPrefs {
+  try {
+    const raw = localStorage.getItem(DEPTH_PREFS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<DepthPrefs>;
+      return {
+        book: parsed.book ?? true,
+        stops: parsed.stops ?? true,
+        publicStops: parsed.publicStops ?? true,
+      };
+    }
+  } catch {
+    // ignore malformed prefs
+  }
+  return { book: true, stops: true, publicStops: true };
+}
 
 function tfToSeconds(tf: string): number {
   const map: Record<string, number> = {
@@ -35,6 +61,23 @@ export function CandleChart() {
   const lastTradePrice = useOrderbookStore((s) => s.lastTradePrice);
 
   const [hasData, setHasData] = useState(false);
+
+  // depth histogram overlay state
+  const [chartApi, setChartApi] = useState<IChartApi | null>(null);
+  const [seriesApi, setSeriesApi] = useState<ISeriesApi<"Candlestick"> | null>(null);
+  const [depthPrefs, setDepthPrefs] = useState<DepthPrefs>(loadDepthPrefs);
+
+  const toggleDepth = (key: keyof DepthPrefs) => {
+    setDepthPrefs((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      try {
+        localStorage.setItem(DEPTH_PREFS_KEY, JSON.stringify(next));
+      } catch {
+        // storage unavailable — keep session-only prefs
+      }
+      return next;
+    });
+  };
 
   // Create chart on mount
   useEffect(() => {
@@ -79,6 +122,8 @@ export function CandleChart() {
     chartRef.current = chart;
     seriesRef.current = series;
     volumeRef.current = volume;
+    setChartApi(chart);
+    setSeriesApi(series);
 
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -94,6 +139,8 @@ export function CandleChart() {
       chartRef.current = null;
       seriesRef.current = null;
       volumeRef.current = null;
+      setChartApi(null);
+      setSeriesApi(null);
     };
   }, []);
 
@@ -195,6 +242,52 @@ export function CandleChart() {
             No trade history — showing live price
           </div>
         )}
+        {chartApi && seriesApi && (
+          <DepthOverlay
+            chart={chartApi}
+            series={seriesApi}
+            showBook={depthPrefs.book}
+            showStops={depthPrefs.stops}
+            showPublic={depthPrefs.publicStops}
+          />
+        )}
+        {/* depth overlay legend / toggles */}
+        <div className="pointer-events-auto absolute left-2 top-2 z-20 flex items-center gap-1.5 rounded border border-border bg-panelLight/80 px-2 py-1 backdrop-blur-sm">
+          <button
+            onClick={() => toggleDepth("book")}
+            title="Глубина стакана на графике"
+            className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+              depthPrefs.book ? "text-gray-100" : "text-gray-500"
+            } hover:text-white`}
+          >
+            <span className="inline-block h-2 w-2 rounded-sm bg-emerald-500/80" />
+            <span className="inline-block h-2 w-2 rounded-sm bg-red-500/80" />
+            Depth
+          </button>
+          <span className="h-3 w-px bg-border" />
+          <button
+            onClick={() => toggleDepth("stops")}
+            title="Мои стоп-триггеры на графике"
+            className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+              depthPrefs.stops ? "text-gray-100" : "text-gray-500"
+            } hover:text-white`}
+          >
+            <span className="inline-block h-2 w-2 rounded-sm bg-amber-400/90" />
+            My stops
+          </button>
+          <span className="h-3 w-px bg-border" />
+          <button
+            onClick={() => toggleDepth("publicStops")}
+            title="Условные заявки всех участников (агрегировано)"
+            className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+              depthPrefs.publicStops ? "text-gray-100" : "text-gray-500"
+            } hover:text-white`}
+          >
+            <span className="inline-block h-2 w-2 rounded-sm border border-emerald-400 bg-transparent" />
+            <span className="inline-block h-2 w-2 rounded-sm border border-red-400 bg-transparent" />
+            All stops
+          </button>
+        </div>
       </div>
     </div>
   );

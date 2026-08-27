@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -39,7 +40,9 @@ async def handle_public_orderbook(websocket: WebSocket, symbol: str) -> None:
             "bids": [[p, q] for p, q in snap["bids"]],
             "asks": [[p, q] for p, q in snap["asks"]],
             "last_trade_price": None,
-            "ts": int(asyncio.get_event_loop().time() * 1000),
+            # epoch milliseconds — NOT asyncio loop time (monotonic, not a
+            # wall-clock value; clients would render nonsense dates)
+            "ts": int(time.time() * 1000),
         }
         await websocket.send_json(snapshot_msg)
         logger.info("Sent initial snapshot for %s: %d bids, %d asks",
@@ -89,7 +92,7 @@ async def handle_public_orderbook(websocket: WebSocket, symbol: str) -> None:
                 if msg.get("action") == "ping":
                     await websocket.send_json({
                         "event": "pong",
-                        "ts": int(asyncio.get_event_loop().time() * 1000),
+                        "ts": int(time.time() * 1000),
                     })
             except asyncio.TimeoutError:
                 pass  # No client message, continue

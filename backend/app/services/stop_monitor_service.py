@@ -1,17 +1,45 @@
 """Stop monitor service — evaluate stop triggers and recompute trailing stops.
 
-Runs as a background asyncio task that subscribes to `pub:trades:{symbol}`
-channels. On each new trade print:
+Trigger-source policy (IMPORTANT)
+---------------------------------
+A pending conditional order is armed by EXACTLY ONE input: the market's
+**last trade price** (a print on `pub:trades:{symbol}`):
 
-  1. Query `stops:{symbol}` for orders whose trigger has been crossed.
+  * SELL-side stop fires when ``last_trade_price <= stop_price``;
+  * BUY-side  stop fires when ``last_trade_price >= stop_price``.
+
+The live order book NEVER arms a stop. Book depth decides only how the
+resulting child market/limit order executes AFTER activation. Arming
+against best bid/ask ("touch" semantics) degenerates any stop whose level
+lies beyond the market into an executable-now taker: a BUY stop @100 while
+the market trades at 50 would fill instantly at ~50 the moment ANY ask
+rests at/below 100 — destroying breakout/protection semantics entirely.
+That was a reported production regression; it is deliberately NOT
+reimplemented (a user who wants immediate execution should place a plain
+limit/market order instead of a conditional one).
+
+The monitor still subscribes to `pub:orderbook:{symbol}`, but non-trade
+events serve ONLY two auxiliary purposes:
+
+  * snapshot payloads carrying ``last_trade_price`` keep the local price
+    cache fresh between prints;
+  * ``stops_changed`` (published when a NEW stop registers) runs an
+    immediate evaluation pass so a stop whose condition is ALREADY true
+    under the last-price rule activates at placement instead of waiting
+    for the next print. Book-only changes cannot arm anything.
+
+On each evaluation tick:
+
+  1. Query `stops:{symbol}` for orders whose trigger crossed the cached
+     last trade price (directional scan — see redis_client/stops.py).
   2. For each triggered stop:
-     a. Load the order from PG (or Redis HASH)
-     b. Verify side matches (sell-stop vs buy-stop logic)
-     c. Convert to a market or limit order (per OrderType)
-     d. Lock balance (now that the trigger has fired)
-     e. Enqueue the new order to `queue:orders`
-     f. Remove from stop queue
-  3. Update trailing stops: recompute trigger based on new high/low.
+     a. Load the order from PG (FOR UPDATE)
+     b. Verify side matches the Redis-side query (defense-in-depth)
+     c. Re-verify the numeric condition against the reference price
+     d. Convert to a market or limit order (per OrderType), lock balance,
+        enqueue to `queue:orders`, remove from the stop queue
+  3. Update trailing stops: recompute trigger based on new high/low
+     (trailing stops keep the trade-print rule for firing).
 
 For trailing stops, the monitor also tracks local extremes (high/low)
 per symbol and calls `update_trailing_extremes()` when a new extreme is
@@ -28,6 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import async_session_factory
 from app.models.enums import OrderSide, OrderStatus, OrderType
+from app.models.order import Order as OrderModel
 from app.redis_client import get_redis
 from app.redis_client import orderbook, pubsub, queues, stops
 from app.repositories.order_repo import OrderRepository
@@ -55,10 +84,36 @@ class StopMonitorService:
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task] = {}  # symbol → task
         self._running = False
+        # Last traded price per symbol (seeded from PG on start(), kept fresh
+        # by trade prints and snapshot payloads carrying last_trade_price).
+        self._last_price: dict[str, Decimal] = {}
         # Track local extremes per symbol for trailing stops
         self._local_high: dict[str, Decimal] = {}
+        # Throttle for public stop-ladder invalidation on trailing drift:
+        # symbol → monotonic timestamp of the last published event.
+        self._last_ladder_publish: dict[str, float] = {}
         self._local_low: dict[str, Decimal] = {}
         self._refresh_task: asyncio.Task | None = None
+
+    async def _publish_stops_changed_throttled(
+        self,
+        redis,
+        symbol: str,
+        min_interval_s: float = 0.5,
+    ) -> None:
+        """Publish the public stop-ladder invalidation at most once per
+        `min_interval_s` per symbol.
+
+        Used for high-frequency drift updates (trailing trigger moves on
+        every new extreme); placement/cancel/trigger fire events publish
+        unconditionally instead.
+        """
+        now = asyncio.get_event_loop().time()
+        last = self._last_ladder_publish.get(symbol)
+        if last is not None and (now - last) < min_interval_s:
+            return
+        self._last_ladder_publish[symbol] = now
+        await pubsub.publish_stops_changed(redis, symbol)
 
     async def start(self, symbols: list[str]) -> None:
         """Start monitoring the given symbols + periodic refresh for new pairs."""
@@ -129,21 +184,43 @@ class StopMonitorService:
         blocking-command interference with the shared pool's health checks.
         Retries on connection errors with exponential backoff.
         """
-        channel = pubsub.trades_channel(symbol)
+        trades_ch = pubsub.trades_channel(symbol)
+        book_ch = pubsub.orderbook_channel(symbol)
 
         while self._running:
             pubsub_obj = None
             try:
-                pubsub_obj = await pubsub.subscribe(channel)
-                logger.info("Stop monitor subscribed to %s", channel)
+                pubsub_obj = await pubsub.subscribe(trades_ch, book_ch)
+                logger.info(
+                    "Stop monitor subscribed to %s + %s", trades_ch, book_ch,
+                )
 
                 async for msg in pubsub.iter_messages(pubsub_obj):
                     if not self._running:
                         break
-                    if msg.get("event") != "trade":
-                        continue
-                    price = Decimal(str(msg["price"]))
-                    await self._process_trade_print(symbol, price)
+                    event = msg.get("event")
+                    if event == "trade":
+                        price = Decimal(str(msg["price"]))
+                        await self._process_trade_print(symbol, price)
+                    elif event in (
+                        "orderbook_snapshot", "orderbook_update", "stops_changed",
+                    ):
+                        # Auxiliary passes over non-trade events only:
+                        #   * snapshot payloads refresh the last-price cache;
+                        #   * stops_changed evaluates freshly placed stops at
+                        #     registration (fires ONLY if the last-price rule
+                        #     already holds — never from book depth).
+                        ltp = msg.get("last_trade_price")
+                        if ltp:
+                            try:
+                                p = Decimal(str(ltp))
+                                if p > 0:
+                                    prev = self._last_price.get(symbol)
+                                    if prev is None or abs(p - prev) >= Decimal("1e-12"):
+                                        self._last_price[symbol] = p
+                            except Exception:
+                                pass
+                        await self._evaluate_symbol_stops(symbol)
 
             except asyncio.CancelledError:
                 logger.info("Stop monitor for %s cancelled", symbol)
@@ -161,6 +238,7 @@ class StopMonitorService:
     async def _process_trade_print(self, symbol: str, price: Decimal) -> None:
         """Process a single trade print: evaluate stops + update trailing."""
         redis = get_redis()
+        self._last_price[symbol] = price
 
         # Update local extremes
         prev_high = self._local_high.get(symbol)
@@ -174,35 +252,71 @@ class StopMonitorService:
 
         # Update trailing stops (recompute triggers)
         if new_high is not None or new_low is not None:
-            await stops.update_trailing_extremes(
+            moved = await stops.update_trailing_extremes(
                 redis, symbol,
                 new_high=float(new_high) if new_high else None,
                 new_low=float(new_low) if new_low else None,
             )
+            if moved:
+                await self._publish_stops_changed_throttled(redis, symbol)
 
-        # Check for triggered plain stops
-        triggered = await stops.get_all_triggered_stops(redis, symbol, price)
-        for order_id in triggered:
-            try:
-                await self._trigger_stop_order(order_id, price)
-            except Exception as e:
-                logger.exception("Failed to trigger stop order %d: %s", order_id, e)
+        # Plain stops: pure last-trade rule (evaluation is idempotent —
+        # the status guard inside _trigger_stop_order blocks double fires)
+        await self._evaluate_symbol_stops(symbol)
 
         # Check for triggered trailing stops (after extreme update)
         triggered_trailing = await stops.get_triggered_trailing_stops(redis, symbol, price)
-        for order_id in triggered_trailing:
+        for order_id, side in triggered_trailing:
             try:
-                await self._trigger_stop_order(order_id, price, is_trailing=True)
+                expected_side = OrderSide(side)
+                await self._trigger_stop_order(
+                    order_id, price, is_trailing=True, expected_side=expected_side,
+                )
             except Exception as e:
                 logger.exception("Failed to trigger trailing stop %d: %s", order_id, e)
+
+    async def _evaluate_symbol_stops(self, symbol: str) -> None:
+        """Evaluate ALL plain stops for `symbol` against the last trade price.
+
+        Single firing rule, re-verified inside the trigger transaction
+        (defense-in-depth): the classic last-trade rule. The live order
+        book plays NO part in arming stops — see the module docstring for
+        why touch/book-driven triggering was removed.
+        """
+        redis = get_redis()
+
+        last = self._last_price.get(symbol)
+        triggered: list[tuple[int, str]] = []
+        if last is not None and last > 0:
+            try:
+                triggered = await stops.get_all_triggered_stops(redis, symbol, last)
+            except Exception as e:
+                logger.exception("Stop monitor %s: last-rule scan failed: %s", symbol, e)
+
+        for order_id, side in triggered:
+            try:
+                expected_side = OrderSide(side)
+                await self._trigger_stop_order(order_id, last, expected_side=expected_side)
+            except Exception as e:
+                logger.exception("Failed to trigger stop order %d: %s", order_id, e)
 
     async def _trigger_stop_order(
         self,
         order_id: int,
-        trigger_price: Decimal,
+        trigger_price: Decimal | None,
         is_trailing: bool = False,
+        expected_side: OrderSide | None = None,
     ) -> None:
-        """Trigger a stop order: convert to market/limit, lock balance, enqueue."""
+        """Trigger a stop order: convert to market/limit, lock balance, enqueue.
+
+        ``expected_side`` comes from the Redis-side directional query and is
+        re-verified here against the PG row (defense-in-depth). For plain
+        stops the numeric condition is re-checked against the reference
+        price that armed this evaluation: sell-stop needs ``price <= stop``,
+        buy-stop needs ``price >= stop``. Trailing stops are exempt because
+        their live trigger drifts away from the stored ``stop_price`` (the
+        trailing ZSET score IS the drifted trigger).
+        """
         redis = get_redis()
         async with async_session_factory() as session:
             async with session.begin():
@@ -215,10 +329,34 @@ class StopMonitorService:
                     # Already triggered or canceled
                     return
 
-                # Verify the trigger direction matches the order's side
-                # Sell-stop: trigger when price <= stop_price (already verified by range query)
-                # Buy-stop: trigger when price >= stop_price (already verified)
-                # The range query handles this, so we just proceed.
+                # Verify the side reported by the Redis queue matches PG
+                if expected_side is not None and order.side != expected_side:
+                    logger.warning(
+                        "Stop %d skipped: Redis side %s != PG side %s",
+                        order_id, expected_side.value, order.side.value,
+                    )
+                    return
+
+                # Defensive directional re-check against the reference
+                # price that armed this evaluation (Redis/PG drift guard):
+                #   sell fires when price <= stop; buy when price >= stop.
+                if not is_trailing and order.stop_price is not None:
+                    stop_dec = Decimal(str(order.stop_price))
+                    ref = Decimal(str(trigger_price)) if trigger_price is not None else None
+                    if ref is None:
+                        return
+                    if order.side == OrderSide.SELL and ref > stop_dec:
+                        logger.info(
+                            "Sell stop %d skipped: price %s above stop %s",
+                            order_id, ref, order.stop_price,
+                        )
+                        return
+                    if order.side == OrderSide.BUY and ref < stop_dec:
+                        logger.info(
+                            "Buy stop %d skipped: price %s below stop %s",
+                            order_id, ref, order.stop_price,
+                        )
+                        return
 
                 # Determine the child order type
                 if order.type in (OrderType.STOP_MARKET, OrderType.TRAILING_STOP):
@@ -283,8 +421,10 @@ class StopMonitorService:
                 order.status = OrderStatus.FILLED
                 order.version += 1
 
-                # Create the child market/limit order
-                from app.models.order import Order as OrderModel
+                # Create the child market/limit order.
+                # The child owns its own reservation (locked_amount) so a later
+                # cancel / worker refund releases exactly what it locked, not
+                # the whole user balance (that was the stuck-funds bug).
                 child = OrderModel(
                     user_id=order.user_id,
                     symbol=order.symbol,
@@ -294,6 +434,7 @@ class StopMonitorService:
                     price=child_price,
                     quantity=order.quantity,
                     parent_order_id=order.id,
+                    locked_amount=lock_amount,
                 )
                 session.add(child)
                 await session.flush()
@@ -340,6 +481,8 @@ class StopMonitorService:
                     side=order.side.value, type=order.type.value,
                     status=order.status.value,
                 )
+                # Public stop-ladder visibility: the fired order left the queue
+                await pubsub.publish_stops_changed(redis, order.symbol)
 
     async def _rescan_pending_stops(self, symbols: list[str]) -> None:
         """On startup, re-evaluate all pending stops against last trade price.
@@ -358,6 +501,10 @@ class StopMonitorService:
                 last_price = await trade_repo_proper.get_last_price(symbol)
                 if last_price is None:
                     continue
+
+                # Seed the in-memory last price so the last-trade rule works
+                # before the first pub/sub print arrives.
+                self._last_price[symbol] = Decimal(str(last_price))
 
                 # Load pending stops from PG
                 pending = await repo.list_pending_stops_by_symbol(symbol)

@@ -53,10 +53,21 @@ export function formatPct(value: number, decimals: number = 2): string {
 }
 
 /**
- * Format a timestamp (ISO string or unix seconds) as HH:MM:SS.
+ * Format a timestamp as HH:MM:SS (browser-local timezone).
+ *
+ * Canonical backend contract is epoch MILLISECONDS; values below 1e11 are
+ * treated as unix SECONDS for backwards compatibility with older payloads.
+ * ISO strings pass straight through to Date parsing.
  */
 export function formatTime(ts: string | number): string {
-  const date = typeof ts === "number" ? new Date(ts * 1000) : new Date(ts);
+  if (ts === undefined || ts === null || ts === "") return "—";
+  let date: Date;
+  if (typeof ts === "number") {
+    date = new Date(ts < 1e11 ? ts * 1000 : ts);
+  } else {
+    date = new Date(ts);
+  }
+  if (isNaN(date.getTime())) return "—";
   return date.toLocaleTimeString("en-US", { hour12: false });
 }
 

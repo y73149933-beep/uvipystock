@@ -1,7 +1,7 @@
 """Trade history REST endpoints."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -14,6 +14,28 @@ from app.repositories.trade_repo import TradeRepository
 from app.schemas.trade import TradeListResponse, TradeResponse
 
 router = APIRouter(prefix="/trades", tags=["trades"])
+
+
+def _trade_to_public(t: Trade) -> dict:
+    """Serialize a Trade row into the public-feed contract.
+
+    ``ts`` is epoch MILLISECONDS (canonical client-side unit, shared with
+    WS trade prints). Naive datetimes (possible from SQLite test doubles)
+    are interpreted as UTC; PostgreSQL's timestamptz returns aware values
+    that keep their offset.
+    """
+    executed = t.executed_at
+    if executed.tzinfo is None:
+        executed = executed.replace(tzinfo=UTC)
+    return {
+        "trade_id": t.id,
+        "symbol": t.symbol,
+        "price": float(t.price),
+        "quantity": float(t.quantity),
+        "side": t.side.value,
+        "ts": int(executed.timestamp() * 1000),
+    }
+
 
 
 @router.get(
@@ -92,19 +114,7 @@ async def list_public_trades(
     """
     repo = TradeRepository(session)
     trades = await repo.list_recent_by_symbol(symbol, limit=limit)
-    return {
-        "trades": [
-            {
-                "trade_id": t.id,
-                "symbol": t.symbol,
-                "price": float(t.price),
-                "quantity": float(t.quantity),
-                "side": t.side.value,
-                "ts": int(t.executed_at.timestamp() * 1000),  # ms
-            }
-            for t in reversed(trades)  # most recent first
-        ],
-    }
+    return {"trades": [_trade_to_public(t) for t in reversed(trades)]}
 
 
 @router.get(

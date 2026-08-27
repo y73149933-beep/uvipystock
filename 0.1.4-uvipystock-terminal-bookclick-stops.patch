@@ -1,0 +1,409 @@
+diff --git a/frontend/src/components/orderbook/OrderBookPanel.tsx b/frontend/src/components/orderbook/OrderBookPanel.tsx
+index 31ccd60..7b3e932 100755
+--- a/frontend/src/components/orderbook/OrderBookPanel.tsx
++++ b/frontend/src/components/orderbook/OrderBookPanel.tsx
+@@ -1,28 +1,155 @@
++/**
++ * Order book panel.
++ *
++ * Features beyond the plain depth view:
++ * 1. Clicking any row autofills the price field of the trade form
++ *    (via the tradeFormStore bridge signal).
++ * 2. The user's OWN conditional orders (stop_market / stop_limit) are shown
++ *    as yellow trigger markers on their trigger prices. Stops deliberately
++ *    never mix into the depth bars: a resting stop is not executable volume,
++ *    real exchanges do not add it to the book either. trailing_stop markers
++ *    are omitted because the frontend does not know the live trailed price
++ *    (it is recomputed server-side in Redis on every trade).
++ */
+ import { useMemo } from "react";
+ import { useOrderbookStore } from "@/store/orderbookStore";
++import { useOrdersStore } from "@/store/ordersStore";
++import { useTradeFormStore } from "@/store/tradeFormStore";
++import type { OrderType } from "@/types/order";
++import { formatPrice, formatQty } from "@/lib/format";
++import { cn } from "@/lib/utils";
+ import { OrderBookRow } from "./OrderBookRow";
+ import { Spread } from "./Spread";
+ 
+ const DEPTH = 15;
++const TRIGGER_TYPES: readonly OrderType[] = ["stop_market", "stop_limit"];
++
++interface Level {
++  price: number;
++  volume: number;
++}
++
++interface UserTrigger {
++  id: number;
++  type: string;
++  side: string;
++  triggerPrice: number;
++  quantity: string;
++}
++
++type BookRow =
++  | { kind: "level"; level: Level; hits: UserTrigger[] }
++  | { kind: "trigger"; trigger: UserTrigger };
++
++/** Relative float equality — WS prices are numbers, REST prices are strings. */
++function samePrice(a: number, b: number): boolean {
++  const scale = Math.max(1, Math.abs(a), Math.abs(b));
++  return Math.abs(a - b) <= 1e-9 * scale;
++}
++
++function TriggerRow({ trigger }: { trigger: UserTrigger }) {
++  const label = trigger.type === "stop_limit" ? "STOP LMT" : "STOP MKT";
++  const arrow = trigger.side === "buy" ? "▲" : "▼";
++  return (
++    <div
++      className="flex items-center justify-between border-l-2 border-yellow-500 bg-yellow-500/5 px-2 py-0.5 text-xs"
++      title={`Your ${trigger.type} order #${trigger.id} triggers at this price`}
++    >
++      <span className="font-mono text-yellow-500">
++        ⚡{arrow} {label} · {formatPrice(trigger.triggerPrice)}
++      </span>
++      <span className="font-mono text-yellow-500/70">
++        {formatQty(trigger.quantity, 6)}
++      </span>
++    </div>
++  );
++}
+ 
+ export function OrderBookPanel() {
+   const bids = useOrderbookStore((s) => s.bids);
+   const asks = useOrderbookStore((s) => s.asks);
+   const spread = useOrderbookStore((s) => s.spread);
+   const symbol = useOrderbookStore((s) => s.symbol);
++  const openOrders = useOrdersStore((s) => s.openOrders);
++  const requestPriceFill = useTradeFormStore((s) => s.requestPriceFill);
+ 
+   // Parse assets from symbol (e.g. "BTC/USD" → base="BTC", quote="USD")
+   const baseAsset = symbol.split("/")[0] || "BTC";
+   const quoteAsset = symbol.split("/")[1] || "USD";
+ 
+-  const topBids = bids.slice(0, DEPTH);
+-  const topAsks = asks.slice(0, DEPTH);
++  // The user's pending stops for THIS symbol that have a known trigger price
++  const triggers = useMemo(() => {
++    return openOrders.flatMap<UserTrigger>((o) => {
++      if (!TRIGGER_TYPES.includes(o.type)) return [];
++      if (o.stop_price === null || o.symbol !== symbol) return [];
++      const p = parseFloat(o.stop_price);
++      if (!Number.isFinite(p)) return [];
++      return [
++        {
++          id: o.id,
++          type: o.type as string,
++          side: o.side as string,
++          triggerPrice: p,
++          quantity: o.remaining_quantity || o.quantity,
++        },
++      ];
++    });
++  }, [openOrders, symbol]);
++
++  /**
++   * Merge depth levels and trigger markers into a single render sequence.
++   * `levels` must already be sorted by price DESCENDING (= render order for
++   * both sections: asks come pre-reversed). A trigger priced exactly at an
++   * existing level collapses into that level's badge instead of its own row.
++   */
++  const buildRows = (levels: Level[]): BookRow[] => {
++    const sortedTriggers = [...triggers].sort(
++      (a, b) => b.triggerPrice - a.triggerPrice,
++    );
++    const rows: BookRow[] = [];
++    let ti = 0;
++    for (const level of levels) {
++      while (
++        ti < sortedTriggers.length &&
++        sortedTriggers[ti].triggerPrice > level.price &&
++        !samePrice(sortedTriggers[ti].triggerPrice, level.price)
++      ) {
++        rows.push({ kind: "trigger", trigger: sortedTriggers[ti++] });
++      }
++      const hits: UserTrigger[] = [];
++      while (
++        ti < sortedTriggers.length &&
++        samePrice(sortedTriggers[ti].triggerPrice, level.price)
++      ) {
++        hits.push(sortedTriggers[ti++]);
++      }
++      rows.push({ kind: "level", level, hits });
++    }
++    while (ti < sortedTriggers.length) {
++      rows.push({ kind: "trigger", trigger: sortedTriggers[ti++] });
++    }
++    return rows;
++  };
++
++  const topBids = useMemo(() => bids.slice(0, DEPTH), [bids]);
++  const topAsks = useMemo(() => asks.slice(0, DEPTH), [asks]);
++  const bidRows = useMemo(
++    () => (triggers.length > 0 ? buildRows(topBids) : topBids.map((level) => ({ kind: "level" as const, level, hits: [] }))),
++    [topBids, triggers],
++  );
++  const askRows = useMemo(
++    () =>
++      triggers.length > 0
++        ? buildRows([...topAsks].reverse())
++        : [...topAsks]
++            .reverse()
++            .map((level) => ({ kind: "level" as const, level, hits: [] })),
++    [topAsks, triggers],
++  );
++
+   const maxVolume = useMemo(
+-    () => Math.max(
+-      ...topBids.map((l) => l.volume),
+-      ...topAsks.map((l) => l.volume),
+-      1,
+-    ),
++    () =>
++      Math.max(...topBids.map((l) => l.volume), ...topAsks.map((l) => l.volume), 1),
+     [topBids, topAsks],
+   );
+ 
+@@ -31,38 +158,62 @@ export function OrderBookPanel() {
+ 
+   return (
+     <div className="flex h-full flex-col">
+-      <div className="border-b border-border px-3 py-2">
++      <div className="flex items-center justify-between border-b border-border px-3 py-2">
+         <h2 className="text-sm font-semibold text-gray-100">Order Book</h2>
++        {triggers.length > 0 && (
++          <span
++            className={cn("rounded bg-yellow-500/10 px-1.5 py-0.5 text-xs text-yellow-500")}
++            title="Your pending stop orders for this symbol"
++          >
++            ⚡ {triggers.length}
++          </span>
++        )}
+       </div>
+       <div className="flex items-center justify-between px-2 py-1 text-xs text-gray-500">
+         <span>Price ({quoteAsset})</span>
+         <span>Volume ({baseAsset})</span>
+       </div>
+-      {/* Asks (reversed so best ask is at bottom, near spread) */}
++      {/* Asks (rendered price-descending so best ask sits above the spread) */}
+       <div className="flex-1 overflow-y-auto">
+-        {[...topAsks].reverse().map((level) => (
+-          <OrderBookRow
+-            key={`ask-${level.price}`}
+-            price={level.price}
+-            volume={level.volume}
+-            side="ask"
+-            maxVolume={maxVolume}
+-          />
+-        ))}
++        {askRows.map((row, i) => {
++          if (row.kind === "trigger") {
++            return <TriggerRow key={`at-${row.trigger.id}`} trigger={row.trigger} />;
++          }
++          return (
++            <OrderBookRow
++              key={`ask-${row.level.price}-${i}`}
++              price={row.level.price}
++              volume={row.level.volume}
++              side="ask"
++              maxVolume={maxVolume}
++              onClick={requestPriceFill}
++              ownStopCount={row.hits.length}
++            />
++          );
++        })}
+       </div>
+       <Spread spread={spread} bidPrice={bidPrice} askPrice={askPrice} />
+       {/* Bids */}
+       <div className="flex-1 overflow-y-auto">
+-        {topBids.map((level) => (
+-          <OrderBookRow
+-            key={`bid-${level.price}`}
+-            price={level.price}
+-            volume={level.volume}
+-            side="bid"
+-            maxVolume={maxVolume}
+-          />
+-        ))}
++        {bidRows.map((row, i) => {
++          if (row.kind === "trigger") {
++            return <TriggerRow key={`bt-${row.trigger.id}`} trigger={row.trigger} />;
++          }
++          return (
++            <OrderBookRow
++              key={`bid-${row.level.price}-${i}`}
++              price={row.level.price}
++              volume={row.level.volume}
++              side="bid"
++              maxVolume={maxVolume}
++              onClick={requestPriceFill}
++              ownStopCount={row.hits.length}
++            />
++          );
++        })}
+       </div>
+     </div>
+   );
+ }
++
++// formatPrice/formatQty come from @/lib/format (see imports)
+diff --git a/frontend/src/components/orderbook/OrderBookRow.tsx b/frontend/src/components/orderbook/OrderBookRow.tsx
+index 47fe76c..e44d95d 100755
+--- a/frontend/src/components/orderbook/OrderBookRow.tsx
++++ b/frontend/src/components/orderbook/OrderBookRow.tsx
+@@ -7,9 +7,15 @@ interface OrderBookRowProps {
+   side: "bid" | "ask";
+   maxVolume: number;
+   onClick?: (price: number) => void;
++  /**
++   * Number of the user's OWN stop orders whose trigger price equals this
++   * level. Renders a small yellow badge so resting stops stay visible
++   * without polluting the depth bars.
++   */
++  ownStopCount?: number;
+ }
+ 
+-export function OrderBookRow({ price, volume, side, maxVolume, onClick }: OrderBookRowProps) {
++export function OrderBookRow({ price, volume, side, maxVolume, onClick, ownStopCount = 0 }: OrderBookRowProps) {
+   const pct = maxVolume > 0 ? (volume / maxVolume) * 100 : 0;
+   const isBid = side === "bid";
+ 
+@@ -17,6 +23,7 @@ export function OrderBookRow({ price, volume, side, maxVolume, onClick }: OrderB
+     <div
+       className="relative flex cursor-pointer items-center justify-between px-2 py-0.5 text-xs hover:bg-panel"
+       onClick={() => onClick?.(price)}
++      title="Click to fill the order form price"
+     >
+       {/* Volume bar background */}
+       <div
+@@ -24,6 +31,14 @@ export function OrderBookRow({ price, volume, side, maxVolume, onClick }: OrderB
+         style={{ width: `${pct}%` }}
+       />
+       <span className={cn("relative z-10 font-mono", isBid ? "text-bid" : "text-ask")}>
++        {ownStopCount > 0 && (
++          <span
++            className="mr-1 rounded bg-yellow-500/15 px-1 text-yellow-500"
++            title={`${ownStopCount} of your stop order(s) trigger at this price`}
++          >
++            ⚡{ownStopCount > 1 ? ownStopCount : ""}
++          </span>
++        )}
+         {formatPrice(price, 2)}
+       </span>
+       <span className="relative z-10 font-mono text-gray-300">
+diff --git a/frontend/src/components/trade-form/TradeForm.tsx b/frontend/src/components/trade-form/TradeForm.tsx
+index 675aa0e..5acf983 100755
+--- a/frontend/src/components/trade-form/TradeForm.tsx
++++ b/frontend/src/components/trade-form/TradeForm.tsx
+@@ -1,4 +1,4 @@
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import { Button } from "@/components/common/Button";
+ import { Input } from "@/components/common/Input";
+ import { OrderTypeSelect } from "./OrderTypeSelect";
+@@ -8,6 +8,7 @@ import { SLTPInputs } from "./SlTpInputs";
+ import { useToast } from "@/components/common/Toast";
+ import { useOrderbookStore } from "@/store/orderbookStore";
+ import { useBalanceStore } from "@/store/balanceStore";
++import { useTradeFormStore } from "@/store/tradeFormStore";
+ import { ordersApi } from "@/api/orders";
+ import type { OrderSide, OrderType, SLTPConfig } from "@/types/order";
+ import { cn } from "@/lib/utils";
+@@ -35,6 +36,25 @@ export function TradeForm() {
+ 
+   const [loading, setLoading] = useState(false);
+ 
++  // Order book click → autofill. Depends on the signal object (nonce), so it
++  // fires on every click even when the same price is clicked twice.
++  const pendingPriceFill = useTradeFormStore((s) => s.pendingPriceFill);
++  useEffect(() => {
++    if (!pendingPriceFill) return;
++    const value = pendingPriceFill.price;
++    if (needsStopPrice) {
++      setStopPrice(value); // stop_market / stop_limit: no price input → fill trigger
++    } else if (needsPrice) {
++      setPrice(value);
++    } else {
++      showToast(
++        `${orderType} orders have no price field — switch to Limit or Stop-Limit to reuse a book price`,
++        "info",
++      );
++    }
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [pendingPriceFill]);
++
+   // Parse base/quote from symbol (e.g. "ORION/RUR" → base="ORION", quote="RUR")
+   const parts = symbol.split("/");
+   const baseAsset = parts[0] || "BTC";
+diff --git a/frontend/src/store/ordersStore.ts b/frontend/src/store/ordersStore.ts
+index 0d516a6..971d0ee 100755
+--- a/frontend/src/store/ordersStore.ts
++++ b/frontend/src/store/ordersStore.ts
+@@ -67,7 +67,10 @@ export const useOrdersStore = create<OrdersState>((set, get) => ({
+           ),
+         };
+       } else {
+-        // New order (placed via WS event)
++        // New order (placed via WS event). NOTE: OrderUpdateMsg carries no
++        // stop_price — for conditional orders we optimistically insert the
++        // stub and immediately re-fetch from REST so the order book's yellow
++        // trigger markers appear without waiting for the 10s poll.
+         const newOrder: Order = {
+           id: orderId,
+           user_id: 0,
+@@ -95,6 +98,9 @@ export const useOrdersStore = create<OrdersState>((set, get) => ({
+           created_at: new Date(msg.ts).toISOString(),
+           updated_at: new Date(msg.ts).toISOString(),
+         };
++        if (["stop_market", "stop_limit", "trailing_stop"].includes(newOrder.type)) {
++          void get().fetchOpenOrders();
++        }
+         return { openOrders: [newOrder, ...state.openOrders] };
+       }
+     });
+diff --git a/frontend/src/store/tradeFormStore.ts b/frontend/src/store/tradeFormStore.ts
+new file mode 100644
+index 0000000..bef614f
+--- /dev/null
++++ b/frontend/src/store/tradeFormStore.ts
+@@ -0,0 +1,39 @@
++/**
++ * Bridge between the order book and the trade form.
++ *
++ * The trade form keeps its fields in local useState, so a click in the
++ * order book cannot call setState directly. This tiny signal store carries
++ * the request across component boundaries:
++ *
++ *   OrderBookRow click -> requestPriceFill(price) -> pendingPriceFill{nonce}
++ *   TradeForm useEffect(nonce) -> writes into price / stop_price field
++ *
++ * The monotonically growing `nonce` guarantees the effect fires even when
++ * the SAME price is clicked twice in a row (referential change only).
++ */
++import { create } from "zustand";
++
++export interface PriceFillSignal {
++  /** Clicked price, raw string ready to be put into an input. */
++  price: string;
++  /** Increases on every request — stable dependency for React effects. */
++  nonce: number;
++}
++
++interface TradeFormBridgeState {
++  pendingPriceFill: PriceFillSignal | null;
++  requestPriceFill: (price: number | string) => void;
++}
++
++let fillNonce = 0;
++
++export const useTradeFormStore = create<TradeFormBridgeState>((set) => ({
++  pendingPriceFill: null,
++  requestPriceFill: (price) =>
++    set({
++      pendingPriceFill: {
++        price: typeof price === "number" ? String(price) : price,
++        nonce: ++fillNonce,
++      },
++    }),
++}));

@@ -1,4 +1,4 @@
-import type { OrderBookSnapshotMsg, OrderBookUpdateMsg, TradePrintMsg } from "./types";
+import type { OrderBookSnapshotMsg, OrderBookUpdateMsg, StopsChangedMsg, TradePrintMsg } from "./types";
 
 /**
  * Public WebSocket client for orderbook + trades streams.
@@ -7,7 +7,7 @@ import type { OrderBookSnapshotMsg, OrderBookUpdateMsg, TradePrintMsg } from "./
  * Sends periodic pings to keep the connection alive.
  */
 
-type MessageHandler = (msg: OrderBookSnapshotMsg | OrderBookUpdateMsg | TradePrintMsg) => void;
+type MessageHandler = (msg: OrderBookSnapshotMsg | OrderBookUpdateMsg | StopsChangedMsg | TradePrintMsg) => void;
 
 export class PublicSocket {
   private ws: WebSocket | null = null;

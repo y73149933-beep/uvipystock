@@ -14,7 +14,9 @@ export function TradingPairList() {
   const fetchPairs = async () => {
     setLoading(true);
     try {
-      const resp = await marketApi.listPairs();
+      // Include deactivated pairs so "deleting" never makes a row vanish:
+      // they stay visible with the Inactive badge and an Activate action.
+      const resp = await marketApi.listPairs(true);
       setPairs(resp);
       setError(null);
     } catch (err) {
@@ -40,7 +42,9 @@ export function TradingPairList() {
   return (
     <div>
       <div className="mb-4 flex items-center justify-between">
-        <h2 className="text-xl font-semibold">Trading Pairs ({pairs.length})</h2>
+        <h2 className="text-xl font-semibold">
+          Trading Pairs ({pairs.filter((p) => p.is_active).length} active / {pairs.length} total)
+        </h2>
         <Button onClick={() => setShowForm(true)}>+ Create Pair</Button>
       </div>
 

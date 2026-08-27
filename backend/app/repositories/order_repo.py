@@ -33,6 +33,23 @@ class OrderRepository(BaseRepository[Order]):
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_user_for_update(self, order_id: int, user_id: int) -> Order | None:
+        """Fetch an order scoped to a user with SELECT ... FOR UPDATE.
+
+        Use in cancel/modify paths: the matching worker concurrently settles
+        fills on the same row inside its own transaction. Without the row
+        lock, cancel can compute the refund from a stale `locked_amount`
+        while the worker is decrementing it → double-unlock / lost funds.
+        Locking the order row serializes cancel against settlement.
+        """
+        stmt = (
+            select(Order)
+            .where(Order.id == order_id, Order.user_id == user_id)
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     # ─── List queries ───────────────────────────────────────────────────────
 
     async def list_user_orders(

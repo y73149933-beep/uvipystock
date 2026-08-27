@@ -117,6 +117,17 @@ class TradingPairNotFoundHTTPError(AppError):
     code = "trading_pair_not_found"
 
 
+class DuplicateTradingPairHTTPError(AppError):
+    """Raised when creating a trading pair whose symbol is already active.
+
+    Note: a soft-deleted (is_active=False) pair is NOT a duplicate —
+    create_trading_pair reactivates it instead of raising.
+    """
+
+    status_code = 409
+    code = "duplicate_trading_pair"
+
+
 class UserNotFoundHTTPError(AppError):
     status_code = 404
     code = "user_not_found"
@@ -175,6 +186,7 @@ __all__ = [
     "OrderValidationHTTPError",
     "PostOnlyCrossHTTPError",
     "TradingPairNotFoundHTTPError",
+    "DuplicateTradingPairHTTPError",
     "UserNotFoundHTTPError",
     "register_exception_handlers",
 ]

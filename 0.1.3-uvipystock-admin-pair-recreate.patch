@@ -1,0 +1,279 @@
+diff --git a/admin/src/api/market.ts b/admin/src/api/market.ts
+index 5840b42..8faca0a 100755
+--- a/admin/src/api/market.ts
++++ b/admin/src/api/market.ts
+@@ -5,8 +5,10 @@ export const marketApi = {
+   createPair: (body: AdminTradingPairCreateRequest) =>
+     adminApi.post<AdminTradingPair>("/api/admin/market/pairs", body),
+ 
+-  listPairs: () =>
+-    adminApi.get<AdminTradingPair[]>("/api/admin/market/pairs"),
++  listPairs: (includeInactive?: boolean) =>
++    adminApi.get<AdminTradingPair[]>(
++      `/api/admin/market/pairs${includeInactive ? "?include_inactive=true" : ""}`,
++    ),
+ 
+   togglePairActive: (pairId: number, isActive: boolean) =>
+     adminApi.patch<AdminTradingPair>(`/api/admin/market/pairs/${pairId}/active?is_active=${isActive}`),
+diff --git a/admin/src/components/market/TradingPairList.tsx b/admin/src/components/market/TradingPairList.tsx
+index a17c574..786108a 100755
+--- a/admin/src/components/market/TradingPairList.tsx
++++ b/admin/src/components/market/TradingPairList.tsx
+@@ -14,7 +14,9 @@ export function TradingPairList() {
+   const fetchPairs = async () => {
+     setLoading(true);
+     try {
+-      const resp = await marketApi.listPairs();
++      // Include deactivated pairs so "deleting" never makes a row vanish:
++      // they stay visible with the Inactive badge and an Activate action.
++      const resp = await marketApi.listPairs(true);
+       setPairs(resp);
+       setError(null);
+     } catch (err) {
+@@ -40,7 +42,9 @@ export function TradingPairList() {
+   return (
+     <div>
+       <div className="mb-4 flex items-center justify-between">
+-        <h2 className="text-xl font-semibold">Trading Pairs ({pairs.length})</h2>
++        <h2 className="text-xl font-semibold">
++          Trading Pairs ({pairs.filter((p) => p.is_active).length} active / {pairs.length} total)
++        </h2>
+         <Button onClick={() => setShowForm(true)}>+ Create Pair</Button>
+       </div>
+ 
+diff --git a/backend/app/api/admin/market.py b/backend/app/api/admin/market.py
+index dd4d420..56df925 100755
+--- a/backend/app/api/admin/market.py
++++ b/backend/app/api/admin/market.py
+@@ -39,10 +39,11 @@ async def create_trading_pair(
+ async def list_trading_pairs(
+     admin: AdminUser,
+     session: SessionDep,
++    include_inactive: bool = False,
+ ) -> list[AdminTradingPairResponse]:
+-    """List all active trading pairs."""
++    """List trading pairs (pass include_inactive=true to see deactivated ones)."""
+     svc = AdminService(session)
+-    pairs = await svc.list_trading_pairs()
++    pairs = await svc.list_trading_pairs(include_inactive=include_inactive)
+     return [AdminTradingPairResponse.model_validate(p) for p in pairs]
+ 
+ 
+diff --git a/backend/app/core/exceptions.py b/backend/app/core/exceptions.py
+index b3c6ae1..3dd1c85 100755
+--- a/backend/app/core/exceptions.py
++++ b/backend/app/core/exceptions.py
+@@ -117,6 +117,17 @@ class TradingPairNotFoundHTTPError(AppError):
+     code = "trading_pair_not_found"
+ 
+ 
++class DuplicateTradingPairHTTPError(AppError):
++    """Raised when creating a trading pair whose symbol is already active.
++
++    Note: a soft-deleted (is_active=False) pair is NOT a duplicate —
++    create_trading_pair reactivates it instead of raising.
++    """
++
++    status_code = 409
++    code = "duplicate_trading_pair"
++
++
+ class UserNotFoundHTTPError(AppError):
+     status_code = 404
+     code = "user_not_found"
+@@ -175,6 +186,7 @@ __all__ = [
+     "OrderValidationHTTPError",
+     "PostOnlyCrossHTTPError",
+     "TradingPairNotFoundHTTPError",
++    "DuplicateTradingPairHTTPError",
+     "UserNotFoundHTTPError",
+     "register_exception_handlers",
+ ]
+diff --git a/backend/app/repositories/trading_pair_repo.py b/backend/app/repositories/trading_pair_repo.py
+index 87d1e2e..9b4bdd3 100755
+--- a/backend/app/repositories/trading_pair_repo.py
++++ b/backend/app/repositories/trading_pair_repo.py
+@@ -27,3 +27,9 @@ class TradingPairRepository(BaseRepository[TradingPair]):
+         stmt = select(TradingPair).where(TradingPair.is_active == True).order_by(TradingPair.symbol)  # noqa: E712
+         result = await self.session.execute(stmt)
+         return result.scalars().all()
++
++    async def list_all(self) -> Sequence[TradingPair]:
++        """All trading pairs including soft-deleted (is_active=False) ones."""
++        stmt = select(TradingPair).order_by(TradingPair.symbol)
++        result = await self.session.execute(stmt)
++        return result.scalars().all()
+diff --git a/backend/app/services/admin_service.py b/backend/app/services/admin_service.py
+index 91c3553..680d0d0 100755
+--- a/backend/app/services/admin_service.py
++++ b/backend/app/services/admin_service.py
+@@ -12,6 +12,7 @@ from typing import Sequence
+ 
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from app.core.exceptions import DuplicateTradingPairHTTPError
+ from app.models.api_key import ApiKey
+ from app.models.balance import Balance
+ from app.models.trading_pair import TradingPair
+@@ -124,10 +125,39 @@ class AdminService:
+         maker_fee_bps: Decimal = Decimal("0"),
+         taker_fee_bps: Decimal = Decimal("0"),
+     ) -> TradingPair:
+-        """Create a new trading pair."""
++        """Create a trading pair, or reactivate a previously deactivated one.
++
++        The admin UI "removes" pairs by flipping ``is_active=False``
++        (soft delete — the row must survive because orders/trades hold FKs
++        to it, and the symbol column is UNIQUE). Therefore:
++
++        * symbol exists AND is_active=False → treat as re-create:
++          overwrite parameters with the new request body, set active;
++        * symbol exists AND is_active=True  → 409 DuplicateTradingPairHTTPError
++          (previously raised raw ValueError → unhandled 500).
++        """
+         existing = await self.pair_repo.get_by_symbol(symbol)
++        if existing is not None and existing.is_active:
++            raise DuplicateTradingPairHTTPError(
++                f"Trading pair {symbol!r} already exists",
++            )
+         if existing is not None:
+-            raise ValueError(f"Trading pair {symbol!r} already exists")
++            logger.info("Reactivating soft-deleted trading pair %s (id=%s)", symbol, existing.id)
++            updated = await self.pair_repo.update(
++                existing.id,
++                base_asset=base_asset,
++                quote_asset=quote_asset,
++                price_precision=price_precision,
++                quantity_precision=quantity_precision,
++                min_lot_size=min_lot_size,
++                max_lot_size=max_lot_size,
++                tick_size=tick_size,
++                maker_fee_bps=maker_fee_bps,
++                taker_fee_bps=taker_fee_bps,
++                is_active=True,
++            )
++            assert updated is not None  # row was just fetched — cannot disappear
++            return updated
+ 
+         pair = await self.pair_repo.create(
+             symbol=symbol,
+@@ -148,7 +178,10 @@ class AdminService:
+         """Activate or deactivate a trading pair."""
+         return await self.pair_repo.update(pair_id, is_active=is_active)
+ 
+-    async def list_trading_pairs(self) -> Sequence[TradingPair]:
++    async def list_trading_pairs(self, include_inactive: bool = False) -> Sequence[TradingPair]:
++        """List trading pairs; optionally include soft-deleted (inactive) ones."""
++        if include_inactive:
++            return await self.pair_repo.list_all()
+         return await self.pair_repo.list_active()
+ 
+     # ─── API key management ─────────────────────────────────────────────────
+diff --git a/backend/tests/unit/test_admin_pair_recreate.py b/backend/tests/unit/test_admin_pair_recreate.py
+new file mode 100644
+index 0000000..ebde2fc
+--- /dev/null
++++ b/backend/tests/unit/test_admin_pair_recreate.py
+@@ -0,0 +1,102 @@
++"""Regression tests: re-creating a soft-deleted trading pair must work.
++
++Bug being covered
++-----------------
++The admin UI "removes" pairs via PATCH /pairs/{id}/active?is_active=false
++(soft delete), while GET /pairs listed only active rows — so a deactivated
++pair looked "deleted". Re-creating it then hit:
++
++    ValueError("Trading pair 'X/Y' already exists") -> unhandled -> HTTP 500
++
++Fix contract:
++1. create on an INACTIVE symbol → reactivates that same row (same id),
++   overwriting parameters with the request body;
++2. create on an ACTIVE symbol → DuplicateTradingPairHTTPError (409);
++3. list_trading_pairs(include_inactive=True) exposes deactivated rows.
++"""
++from __future__ import annotations
++
++import sys
++from decimal import Decimal
++from pathlib import Path
++
++import pytest
++import pytest_asyncio
++from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
++
++_BACKEND = Path(__file__).resolve().parents[2]
++if str(_BACKEND) not in sys.path:
++    sys.path.insert(0, str(_BACKEND))
++
++import app.models  # noqa: E402,F401  — registers every ORM mapper
++from app.core.exceptions import DuplicateTradingPairHTTPError  # noqa: E402
++from app.db.base import Base  # noqa: E402
++from app.models.trading_pair import TradingPair  # noqa: E402
++from app.services.admin_service import AdminService  # noqa: E402
++
++
++BASE_KWARGS = dict(
++    base_asset="RUR",
++    quote_asset="ORION",
++    price_precision=4,
++    quantity_precision=2,
++    min_lot_size=Decimal("0.01"),
++    max_lot_size=Decimal("1000"),
++    tick_size=Decimal("0.0001"),
++    maker_fee_bps=Decimal("10"),
++    taker_fee_bps=Decimal("20"),
++)
++
++
++@pytest_asyncio.fixture
++async def svc():
++    """AdminService over a fresh in-memory SQLite DB (trading_pairs only)."""
++    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
++    async with engine.begin() as conn:
++        await conn.run_sync(
++            lambda sc: Base.metadata.create_all(sc, tables=[TradingPair.__table__])
++        )
++    maker = async_sessionmaker(engine, expire_on_commit=False)
++    async with maker() as session:
++        yield AdminService(session)
++    await engine.dispose()
++
++
++class TestTradingPairRecreate:
++    async def test_create_inserts_active_pair(self, svc):
++        pair = await svc.create_trading_pair(symbol="RUR/ORION", **BASE_KWARGS)
++        assert pair.id is not None
++        assert pair.is_active is True
++        assert str(pair.tick_size) == "0.0001"
++
++    async def test_recreate_after_deactivate_reactivates_same_row(self, svc):
++        original = await svc.create_trading_pair(symbol="RUR/ORION", **BASE_KWARGS)
++
++        # "Delete" in the admin UI == soft delete
++        await svc.toggle_pair_active(original.id, False)
++        assert (await svc.pair_repo.get_by_symbol("RUR/ORION")).is_active is False
++
++        # Re-create with DIFFERENT parameters — must reactivate, not duplicate,
++        # and apply the new settings.
++        new_kwargs = dict(BASE_KWARGS, tick_size=Decimal("0.01"), quantity_precision=6)
++        restored = await svc.create_trading_pair(symbol="RUR/ORION", **new_kwargs)
++
++        assert restored.id == original.id
++        assert restored.is_active is True
++        assert str(restored.tick_size) == "0.01"
++        assert restored.quantity_precision == 6
++
++    async def test_duplicate_of_active_pair_raises_409(self, svc):
++        await svc.create_trading_pair(symbol="RUR/ORION", **BASE_KWARGS)
++        with pytest.raises(DuplicateTradingPairHTTPError) as exc_info:
++            await svc.create_trading_pair(symbol="RUR/ORION", **BASE_KWARGS)
++        assert exc_info.value.status_code == 409
++        assert exc_info.value.code == "duplicate_trading_pair"
++
++    async def test_list_filters_and_include_inactive(self, svc):
++        pair = await svc.create_trading_pair(symbol="RUR/ORION", **BASE_KWARGS)
++        await svc.toggle_pair_active(pair.id, False)
++
++        assert await svc.list_trading_pairs() == []
++        inactive = await svc.list_trading_pairs(include_inactive=True)
++        assert [p.symbol for p in inactive] == ["RUR/ORION"]

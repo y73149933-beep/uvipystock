@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/common/Button";
 import { Input } from "@/components/common/Input";
 import { OrderTypeSelect } from "./OrderTypeSelect";
@@ -8,6 +8,7 @@ import { SLTPInputs } from "./SlTpInputs";
 import { useToast } from "@/components/common/Toast";
 import { useOrderbookStore } from "@/store/orderbookStore";
 import { useBalanceStore } from "@/store/balanceStore";
+import { useTradeFormStore } from "@/store/tradeFormStore";
 import { ordersApi } from "@/api/orders";
 import type { OrderSide, OrderType, SLTPConfig } from "@/types/order";
 import { cn } from "@/lib/utils";
@@ -34,6 +35,25 @@ export function TradeForm() {
   const [tpLimitPrice, setTpLimitPrice] = useState("");
 
   const [loading, setLoading] = useState(false);
+
+  // Order book click → autofill. Depends on the signal object (nonce), so it
+  // fires on every click even when the same price is clicked twice.
+  const pendingPriceFill = useTradeFormStore((s) => s.pendingPriceFill);
+  useEffect(() => {
+    if (!pendingPriceFill) return;
+    const value = pendingPriceFill.price;
+    if (needsStopPrice) {
+      setStopPrice(value); // stop_market / stop_limit: no price input → fill trigger
+    } else if (needsPrice) {
+      setPrice(value);
+    } else {
+      showToast(
+        `${orderType} orders have no price field — switch to Limit or Stop-Limit to reuse a book price`,
+        "info",
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPriceFill]);
 
   // Parse base/quote from symbol (e.g. "ORION/RUR" → base="ORION", quote="RUR")
   const parts = symbol.split("/");
