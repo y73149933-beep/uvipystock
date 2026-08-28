@@ -258,6 +258,36 @@ class MatchingWorker:
         """Match a new order against the book, persist trades, update balances."""
         redis = self._redis
 
+        # INVARIANT GUARD: conditional orders must never be matched directly.
+        # They wait in stops:{symbol} until StopMonitorService converts them
+        # into MARKET/LIMIT children. If one reaches the queue anyway (a
+        # bypass bug — SL/TP activation used to enqueue stop children
+        # verbatim), refuse instead of executing: the bridge's _TYPE_MAP
+        # would silently turn stop_market into a plain MARKET taker, which
+        # fills instantly whenever the book has liquidity (the reported
+        # "stops fire instantly" regression).
+        if payload.type in ("stop_market", "stop_limit", "trailing_stop"):
+            logger.critical(
+                "[place] REFUSED stop-type order %d (%s %s %s): conditional "
+                "orders must fire via the stop monitor, never via the matcher",
+                payload.order_id, payload.side, payload.type, payload.symbol,
+            )
+            await pubsub.publish_order_update(
+                redis, user_id=payload.user_id,
+                event="rejected",
+                order_id=payload.order_id, symbol=payload.symbol,
+                side=payload.side, type=payload.type,
+                status=OrderStatus.REJECTED.value,
+            )
+            return {
+                "action": "place",
+                "order_id": payload.order_id,
+                "outcome": "refused_stop_type",
+                "trades": [],
+                "remaining_qty": 0.0,
+                "rejected": True,
+            }
+
         # 1. Load opposite-side book snapshot from Redis
         maker_orders = await orderbook.get_opposite_orders_for_match(
             redis, payload.symbol, payload.side, limit=1000,
@@ -296,6 +326,13 @@ class MatchingWorker:
         )
 
         # 4. Match!
+        best_maker = maker_orders[0] if maker_orders else None
+        logger.info(
+            "[place] order=%d %s %s price=%s qty=%s book: %d maker(s), best=%s",
+            payload.order_id, payload.side, payload.type,
+            payload.price, payload.quantity,
+            len(maker_orders), best_maker["price"] if best_maker else "-",
+        )
         trades, outcome_int, remaining = self.engine.match_active_order(corder)
         outcome_str = outcome_to_str(outcome_int)
 
@@ -307,11 +344,19 @@ class MatchingWorker:
             "remaining_qty": remaining,
             "rejected": is_outcome_reject(outcome_int),
         }
+        logger.info(
+            "[place] order=%d outcome=%s trades=%d remaining=%s",
+            payload.order_id, outcome_str, len(trades), remaining,
+        )
 
         # 5. Handle rejection (no trades emitted)
         if is_outcome_reject(outcome_int):
             # The order service should have already handled balance unlock
             # for FOK/Post-Only rejections. Here we just publish the event.
+            logger.warning(
+                "[place] order=%d not executed: outcome=%s (funds unlocked by order service)",
+                payload.order_id, outcome_str,
+            )
             await pubsub.publish_order_update(
                 redis, user_id=payload.user_id,
                 event="rejected" if outcome_str == "post_only_cross" else "expired",
@@ -358,6 +403,10 @@ class MatchingWorker:
                             base_asset=pair.base_asset,
                             quote_asset=pair.quote_asset,
                         )
+                        logger.info(
+                            "[settle] order=%d settled %d trade(s)",
+                            payload.order_id, len(enriched_trades),
+                        )
             except TakerOrderInvalidError as e:
                 logger.error(
                     "Match for taker %d refused: %s — skipping refund/rest",
@@ -367,6 +416,10 @@ class MatchingWorker:
 
         # 7. If taker has remaining qty and is LIMIT/POST_ONLY/ICEBERG → insert as resting
         if remaining > 0 and payload.type in ("limit", "post_only", "iceberg"):
+            logger.info(
+                "[rest] order=%d resting %s @ %s",
+                payload.order_id, remaining, payload.price,
+            )
             await self._insert_resting_taker(payload, remaining)
         elif payload.side == "buy" and (
             payload.type == "market"

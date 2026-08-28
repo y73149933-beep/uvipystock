@@ -210,7 +210,7 @@ async def place_bulk_orders(
 # ─── PUT /orders/{id} (Cancel-Replace) ───────────────────────────────────────
 
 @router.put(
-    "/{order_id}",
+    "/{order_id:int}",
     response_model=OrderResponse,
     dependencies=[Depends(require_permission("trade"))],
 )
@@ -242,37 +242,6 @@ async def modify_order(
             details={"asset": e.asset, "needed": str(e.needed), "available": str(e.available)},
         )
     return _order_to_response(order)
-
-
-# ─── DELETE /orders/{id} ─────────────────────────────────────────────────────
-
-@router.delete(
-    "/{order_id}",
-    response_model=OrderCancelResponse,
-    dependencies=[Depends(require_permission("trade"))],
-)
-async def cancel_order(
-    request: Request,
-    user_id: AuthenticatedUser,
-    session: SessionDep,
-    order_id: int,
-) -> OrderCancelResponse:
-    """Cancel a single order."""
-    svc = OrderService(session)
-    try:
-        order = await svc.cancel_order(user_id, order_id)
-        await session.commit()
-        await session.refresh(order)
-    except OrderNotFoundError as e:
-        raise OrderNotFoundHTTPError(message=str(e))
-    except OrderNotCancelableError as e:
-        raise OrderNotCancelableHTTPError(message=str(e))
-
-    return OrderCancelResponse(
-        order_id=order.id,
-        status=order.status,
-        canceled_at=order.updated_at,
-    )
 
 
 # ─── DELETE /orders/bulk ─────────────────────────────────────────────────────
@@ -307,6 +276,37 @@ async def cancel_bulk_orders(
         canceled_orders=canceled_ids,
         failed=[],
         total_unlocked=[],
+    )
+
+
+# ─── DELETE /orders/{id} ─────────────────────────────────────────────────────
+
+@router.delete(
+    "/{order_id:int}",
+    response_model=OrderCancelResponse,
+    dependencies=[Depends(require_permission("trade"))],
+)
+async def cancel_order(
+    request: Request,
+    user_id: AuthenticatedUser,
+    session: SessionDep,
+    order_id: int,
+) -> OrderCancelResponse:
+    """Cancel a single order."""
+    svc = OrderService(session)
+    try:
+        order = await svc.cancel_order(user_id, order_id)
+        await session.commit()
+        await session.refresh(order)
+    except OrderNotFoundError as e:
+        raise OrderNotFoundHTTPError(message=str(e))
+    except OrderNotCancelableError as e:
+        raise OrderNotCancelableHTTPError(message=str(e))
+
+    return OrderCancelResponse(
+        order_id=order.id,
+        status=order.status,
+        canceled_at=order.updated_at,
     )
 
 

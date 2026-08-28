@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.enums import OrderSide, OrderStatus, OrderType
 from app.models.trade import Trade
 from app.redis_client import get_redis
-from app.redis_client import orderbook, pubsub
+from app.redis_client import orderbook, orders_index, pubsub, queues, stops
 from app.repositories.balance_repo import BalanceRepository
 from app.repositories.order_repo import OrderRepository
 from app.repositories.trade_repo import TradeRepository
@@ -434,12 +434,23 @@ class TradeService:
     async def _activate_sltp_children(self, parent_order) -> None:
         """When a parent order fills, activate its SL/TP children.
 
-        Children move from PENDING → NEW (or are enqueued as market/limit).
-        For simplicity, this enqueues them as new orders via the matching
-        worker. A full implementation would also register stop-type children
-        in the stop queue.
+        Conditional children (stop_market / stop_limit) are registered in
+        the STOP QUEUE (``stops:{symbol}``) and stay PENDING until the
+        monitor's last-trade rule fires them — exactly like standalone
+        conditional orders placed via the API. The previous behavior
+        enqueued them straight into ``queue:orders``, where the bridge's
+        _TYPE_MAP silently converted stop_market→MARKET / stop_limit→LIMIT,
+        so every SL executed immediately whenever the book had liquidity
+        (the reported "stops fire instantly" regression).
+
+        Plain children (TP limit) still go to the engine right away, but
+        now also get the Redis order HASH + open-orders index: the trigger
+        scan reads `side` from the HASH, settlement resolves maker user_id
+        from it, and the public ladder reads stop_price/quantity.
+
+        Both branches publish sl_tp_activated; conditional registration
+        additionally invalidates the public stop ladder.
         """
-        from app.redis_client import queues
         redis = get_redis()
 
         # Load children
@@ -447,22 +458,50 @@ class TradeService:
         for child in children:
             if child.status != OrderStatus.PENDING:
                 continue
-            child.status = OrderStatus.NEW
-            child.version += 1
 
-            # Enqueue place action
-            payload = queues.build_order_action_payload(
-                action="place",
-                order_id=child.id,
-                symbol=child.symbol,
-                user_id=child.user_id,
-                side=child.side.value,
-                type=child.type.value,
-                price=float(child.price) if child.price else None,
-                quantity=float(child.quantity),
-                parent_order_id=parent_order.id,
+            is_conditional = child.type in (
+                OrderType.STOP_MARKET, OrderType.STOP_LIMIT,
             )
-            await queues.enqueue_order_action(redis, payload)
+
+            if is_conditional:
+                # Arm the conditional child: stays PENDING until its stop
+                # trigger fires (the monitor only converts PENDING rows).
+                await stops.add_stop_order(
+                    redis, order_id=child.id, symbol=child.symbol,
+                    stop_price=child.stop_price or Decimal("0"),
+                )
+            else:
+                # Plain child → straight to the matching engine.
+                child.status = OrderStatus.NEW
+                payload = queues.build_order_action_payload(
+                    action="place",
+                    order_id=child.id,
+                    symbol=child.symbol,
+                    user_id=child.user_id,
+                    side=child.side.value,
+                    type=child.type.value,
+                    price=float(child.price) if child.price else None,
+                    quantity=float(child.quantity),
+                    parent_order_id=parent_order.id,
+                )
+                await queues.enqueue_order_action(redis, payload)
+
+            # Shared registration (both branches). Without the HASH a
+            # conditional child is a phantom in the trigger scan (skipped,
+            # never fires) and a resting TP child settles under user 0.
+            await orders_index.add_open_order(redis, child.user_id, child.symbol, child.id)
+            await orderbook.store_order_hash(redis, child.id, {
+                "order_id": str(child.id),
+                "user_id": str(child.user_id),
+                "symbol": child.symbol,
+                "side": child.side.value,
+                "type": child.type.value,
+                "price": str(child.price) if child.price else "",
+                "stop_price": str(child.stop_price) if child.stop_price else "",
+                "quantity": str(child.quantity),
+                "is_iceberg": "0",
+            })
+            child.version += 1
 
             # Publish SL/TP activation event
             await pubsub.publish_sl_tp_activated(
@@ -471,6 +510,9 @@ class TradeService:
                 sl_order_id=parent_order.sl_order_id,
                 tp_order_id=parent_order.tp_order_id,
             )
+            if is_conditional:
+                # Public stop-ladder visibility: this level just appeared
+                await pubsub.publish_stops_changed(redis, child.symbol)
 
 
 __all__ = [

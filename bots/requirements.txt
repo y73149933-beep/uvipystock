@@ -1,0 +1,10 @@
+# Bot runtime dependencies.
+# Install with:  pip install -r bots/requirements.txt
+#
+# These are intentionally separate from the backend's pyproject.toml — bots
+# run on a developer's machine against a live exchange, not as part of the
+# FastAPI service, so they don't need SQLAlchemy / asyncpg / Cython / etc.
+
+websockets>=12.0,<14
+rich>=13.7,<14
+httpx>=0.27,<0.29

@@ -238,6 +238,7 @@ class StopMonitorService:
     async def _process_trade_print(self, symbol: str, price: Decimal) -> None:
         """Process a single trade print: evaluate stops + update trailing."""
         redis = get_redis()
+        logger.debug("[print] %s @ %s", symbol, price)
         self._last_price[symbol] = price
 
         # Update local extremes
@@ -292,6 +293,13 @@ class StopMonitorService:
                 triggered = await stops.get_all_triggered_stops(redis, symbol, last)
             except Exception as e:
                 logger.exception("Stop monitor %s: last-rule scan failed: %s", symbol, e)
+
+        if triggered:
+            logger.info(
+                "[stops] %s: last=%s crossed %d conditional order(s): %s",
+                symbol, last, len(triggered),
+                [(oid, s) for oid, s in triggered],
+            )
 
         for order_id, side in triggered:
             try:
@@ -467,6 +475,14 @@ class StopMonitorService:
                     "is_iceberg": "0",
                 }
                 await orderbook.store_order_hash(redis, child.id, metadata)
+
+                logger.info(
+                    "[stop] order=%d TRIGGERED: %s stop=%s ref=%s → child %s %s "
+                    "qty=%s (lock %s %s)",
+                    order.id, order.side.value, order.stop_price, trigger_price,
+                    child.type.value, child.side.value, child.quantity,
+                    lock_asset, lock_amount,
+                )
 
                 # Remove from stop queue
                 if is_trailing:
