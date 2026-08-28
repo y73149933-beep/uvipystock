@@ -1,3 +1,6 @@
+# patch-files
+*.patch
+
 # Python
 __pycache__/
 *.py[cod]
