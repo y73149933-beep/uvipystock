@@ -72,3 +72,48 @@ images (post_commit imports, worker requeue constant, frontend bundle).
 * P3 E2E: 100/100 filled, 200/200 trades, 50/50 order events per user,
   refused=0, requeued=0, worker errors=0.
 * WS burst tail (real, unfixed): e2e p50 1314ms, p99 2102ms.
+
+
+## P5 order-type coverage (2026-11-09, run perf36)
+
+Functional checks for every OrderType + lifecycle: 17/17 PASS.
+limit-GTC taker, IOC (partial→expired, no rest, locks released), FOK fill / no-liquidity
+(row closed, funds released, zero trades), post_only crossing (rejected, funds released),
+iceberg hidden backfill, stop_market (armed→triggered→child filled), stop_limit
+(armed→triggered→child), trailing_stop armed state, market+SL/TP children,
+modify (cancel/replace), bulk place. P3 regression stayed 100/100 filled, P1 264 r/s.
+
+Server bugs found by P5 and fixed (all verified by re-run):
+
+1. **Worker reject paths never closed the order row.** post_only-cross and FOK-fail
+   published only an event: the row stayed `new` with `locked_amount` held and no book
+   entry — funds stuck until manual cancel. `worker._finalize_not_executed()` now closes
+   the row (REJECTED/EXPIRED), pessimistically unlocks the reservation and drops the
+   open-orders index + order HASH. IOC remainder gets the same treatment (EXPIRED) and
+   an `expired` event.
+2. **Stop/trailing registration died under post-commit deferral.** `_register_stop_order`
+   touched expired ORM instances after the request session closed. It now takes a plain
+   value snapshot (`_stop_order_snapshot`); stop_monitor's triggered-effects closure
+   likewise captures scalars instead of reading `order.*` after commit.
+3. **Engine float dust poisoned settlement.** The matcher tracks remainders in float;
+   fill quantities like 0.0025000000000000005 summed past the exact Decimal lock and
+   `settle_pessimistic` raised `Insufficient locked balance ... need 0.005000000000000000204,
+   have 0.005` — valid matches dead-lettered. `trade_service.persist_trade_batch` now
+   clamps every fill leg to its own exact remaining, and the worker quantizes float
+   remainders (`_quant`, 12 dp) before writing them back into Redis HASHes.
+
+Known issues still open:
+- `BalanceVersionConflict` → HTTP 500 under concurrent placements for one user
+  (optimistic balance lock, 3 retries insufficient; harness retries around it).
+- Stop monitor reaction to a print can lag several seconds right after a burst
+  (P3-scale event backlog); trigger semantics itself verified correct.
+- One-off `Insufficient locked` guard trip per run under full-suite load (a settle
+  attempted against an already-zero per-order lock). The pessimistic guard rejected
+  it, balances verified consistent afterwards (order locks sum to zero, DLQ empty).
+  Root cause not yet pinned down.
+
+Harness (perf_suite.py P5) notes: the order-type phase now starts with the same
+clean-slate purge as phase0 (cancel resting + purge stops/trailing/ob keys), because
+P2–P4 residual liquidity measurably changes trigger/precheck outcomes. The market-buy
+precheck validates against visible ask volume only, so the iceberg hidden-reserve
+check drives in via two consecutive buys (visible first, then backfilled hidden).
