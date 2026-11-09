@@ -390,7 +390,9 @@ class OrderService:
         redis = get_redis()
         if is_stop:
             defer_after_commit(
-                self.session, partial(self._register_stop_order, redis, order, dto),
+                self.session,
+                partial(self._register_stop_order, redis,
+                        self._stop_order_snapshot(order, user_id)),
             )
         else:
             payload = queues.build_order_action_payload(
@@ -490,47 +492,65 @@ class OrderService:
     async def _register_stop_order(
         self,
         redis,
-        order: Order,
-        dto: OrderCreateDTO,
+        od: dict[str, Any],
     ) -> None:
-        """Register a stop-type order in the Redis stop queue."""
-        if order.type == OrderType.TRAILING_STOP:
+        """Register a stop-type order in the Redis stop queue.
+
+        Takes a PLAIN VALUE SNAPSHOT (not the ORM object): this runs as a
+        post-commit deferred effect, and by then the request session may
+        already be closed — expired instances would explode on attribute
+        access (found by P5 coverage: stops silently failed to arm).
+        """
+        if od["type"] == OrderType.TRAILING_STOP.value:
             # Trailing stop: register with trailing state
             await stops.register_trailing_stop(
                 redis,
-                order_id=order.id,
-                symbol=order.symbol,
-                side=order.side,
-                delta_type="abs",  # TODO: support pct via dto
-                delta_value=order.trailing_delta or Decimal("0"),
-                initial_extreme=order.stop_price or Decimal("0"),  # will be updated by monitor
-                initial_trigger=order.stop_price or Decimal("0"),
+                order_id=od["order_id"],
+                symbol=od["symbol"],
+                side=OrderSide(od["side"]),
+                delta_type="abs",  # TODO: support pct
+                delta_value=od["trailing_delta"],
+                initial_extreme=od["stop_price"],  # will be updated by monitor
+                initial_trigger=od["stop_price"],
             )
         else:
             # Plain stop: add to stops ZSET
             await stops.add_stop_order(
                 redis,
-                order_id=order.id,
-                symbol=order.symbol,
-                stop_price=order.stop_price or Decimal("0"),
+                order_id=od["order_id"],
+                symbol=od["symbol"],
+                stop_price=od["stop_price"],
             )
         # Add to open-orders index (stop orders are "open" while pending)
-        await orders_index.add_open_order(redis, order.user_id, order.symbol, order.id)
+        await orders_index.add_open_order(redis, od["user_id"], od["symbol"], od["order_id"])
         # Store order HASH
         metadata = {
-            "order_id": str(order.id),
-            "user_id": str(order.user_id),
+            "order_id": str(od["order_id"]),
+            "user_id": str(od["user_id"]),
+            "symbol": od["symbol"],
+            "side": od["side"],
+            "type": od["type"],
+            "stop_price": str(od["stop_price"]) if od["stop_price"] else "",
+            "quantity": str(od["quantity"]),
+            "is_iceberg": "0",
+        }
+        await orderbook.store_order_hash(redis, od["order_id"], metadata)
+
+        # Public stop-ladder visibility: this level just appeared
+        await pubsub.publish_stops_changed(redis, od["symbol"])
+
+    def _stop_order_snapshot(self, order: Order, user_id: int) -> dict[str, Any]:
+        """Value snapshot for _register_stop_order (safe after session close)."""
+        return {
+            "order_id": order.id,
+            "user_id": user_id,
             "symbol": order.symbol,
             "side": order.side.value,
             "type": order.type.value,
-            "stop_price": str(order.stop_price) if order.stop_price else "",
-            "quantity": str(order.quantity),
-            "is_iceberg": "0",
+            "stop_price": order.stop_price or Decimal("0"),
+            "trailing_delta": order.trailing_delta or Decimal("0"),
+            "quantity": order.quantity,
         }
-        await orderbook.store_order_hash(redis, order.id, metadata)
-
-        # Public stop-ladder visibility: this level just appeared
-        await pubsub.publish_stops_changed(redis, order.symbol)
 
     # ─── CANCEL ─────────────────────────────────────────────────────────────
 
@@ -997,7 +1017,8 @@ class OrderService:
             # Redis registration
             if is_stop:
                 defer_after_commit(
-                    self.session, partial(self._register_stop_order, redis, order, dto),
+                    self.session, partial(self._register_stop_order, redis,
+                                          self._stop_order_snapshot(order, user_id)),
                 )
             else:
                 payload = queues.build_order_action_payload(

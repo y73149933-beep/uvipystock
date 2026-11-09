@@ -479,6 +479,10 @@ class StopMonitorService:
                     "is_iceberg": "0",
                 }
 
+                _ouser, _osym = order.user_id, order.symbol
+                _oside_s, _otype = order.side.value, order.type.value
+                _ostatus = order.status.value
+
                 async def _triggered_redis_effects() -> None:
                     await queues.enqueue_order_action(redis, payload)
 
@@ -489,19 +493,19 @@ class StopMonitorService:
 
                     # Remove from stop queue
                     if is_trailing:
-                        await stops.remove_trailing_stop(redis, order_id, order.symbol)
+                        await stops.remove_trailing_stop(redis, order_id, _osym)
                     else:
-                        await stops.remove_stop_order(redis, order_id, order.symbol)
+                        await stops.remove_stop_order(redis, order_id, _osym)
 
                     # Publish order triggered event
                     await pubsub.publish_order_update(
-                        redis, user_id=order.user_id, event="triggered",
-                        order_id=order.id, symbol=order.symbol,
-                        side=order.side.value, type=order.type.value,
-                        status=order.status.value,
+                        redis, user_id=_ouser, event="triggered",
+                        order_id=order_id, symbol=_osym,
+                        side=_oside_s, type=_otype,
+                        status=_ostatus,
                     )
                     # Public stop-ladder visibility: the fired order left the queue
-                    await pubsub.publish_stops_changed(redis, order.symbol)
+                    await pubsub.publish_stops_changed(redis, _osym)
 
                 defer_after_commit(session, _triggered_redis_effects)
 

@@ -182,6 +182,20 @@ class TradeService:
             maker_id = int(trade_dict["maker_order_id"])
             price = Decimal(str(trade_dict["price"]))
             qty = Decimal(str(trade_dict["quantity"]))
+            # The engine tracks remainders in float; fill quantities can
+            # carry ~1e-19 float dust and their sum can exceed the order's
+            # exact Decimal remaining/lock by that dust. Clamping each leg
+            # to its own remaining makes settlement against locked_amount
+            # match exactly — otherwise a perfectly valid match dies with
+            # "Insufficient locked balance for settle" and dead-letters.
+            _mo_gate = maker_orders[maker_id]
+            qty = min(
+                qty,
+                taker_order.remaining_quantity - taker_total_qty,
+                _mo_gate.remaining_quantity,
+            )
+            if qty <= 0:
+                continue
             quote_qty = price * qty
 
             trade = Trade(

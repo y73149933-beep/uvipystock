@@ -66,6 +66,7 @@ from app.redis_client import get_redis
 from app.redis_client import orderbook, orders_index, queues, pubsub
 from app.repositories.order_repo import OrderRepository
 from app.repositories.trading_pair_repo import TradingPairRepository
+from app.services.balance_service import BalanceService
 from app.services.trade_service import TradeService, TakerOrderInvalidError
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,17 @@ class OrderActionPayload:
 # Bounded retries for actions that reference a not-yet-committed row
 # (the enqueue-before-commit race; see app/services/post_commit.py).
 _TAKER_RACE_MAX_ATTEMPTS = 5
+
+
+def _quant(x: float) -> str:
+    """12-decimal fixed string for a float quantity.
+
+    The engine carries float remainders (e.g. 0.06 - 0.04 = 0.019999999999999997);
+    writing that into the Redis HASH seeds float dust into every later match
+    of the resting order. 12 decimals is far below any configured quantity
+    step, so this only strips binary noise.
+    """
+    return f"{x:.12f}"
 
 
 class MatchingWorker:
@@ -367,10 +379,17 @@ class MatchingWorker:
 
         # 5. Handle rejection (no trades emitted)
         if is_outcome_reject(outcome_int):
-            # The order service should have already handled balance unlock
-            # for FOK/Post-Only rejections. Here we just publish the event.
+            # The order service does NOT know about engine outcomes (the
+            # place action is processed asynchronously), so the worker must
+            # close the row and release the reservation itself. Previously
+            # this path only published an event, leaving post_only-cross /
+            # FOK-failed orders in 'new' with locked funds and no book entry
+            # (stuck money until manual cancel — reproduced by P5 coverage).
+            terminal = (OrderStatus.REJECTED if outcome_str == "post_only_cross"
+                        else OrderStatus.EXPIRED)
+            await self._finalize_not_executed(payload, terminal, reason=outcome_str)
             logger.warning(
-                "[place] order=%d not executed: outcome=%s (funds unlocked by order service)",
+                "[place] order=%d not executed: outcome=%s (row closed, funds released)",
                 payload.order_id, outcome_str,
             )
             await pubsub.publish_order_update(
@@ -378,7 +397,7 @@ class MatchingWorker:
                 event="rejected" if outcome_str == "post_only_cross" else "expired",
                 order_id=payload.order_id, symbol=payload.symbol,
                 side=payload.side, type=payload.type,
-                status=OrderStatus.REJECTED.value if outcome_str == "post_only_cross" else OrderStatus.EXPIRED.value,
+                status=terminal.value,
             )
             return result
 
@@ -476,6 +495,20 @@ class MatchingWorker:
                     )
                 return result
 
+        # 6b. IOC with remaining quantity: the remainder neither rests on the
+        # book (rest is GTC semantics) nor gets refunded — close the row as
+        # EXPIRED and release the leftover reservation. settle already shrank
+        # the per-order locked_amount by the filled portion.
+        if payload.type == "ioc" and remaining > 0:
+            await self._finalize_not_executed(payload, OrderStatus.EXPIRED,
+                                              reason="order_rejected")
+            await pubsub.publish_order_update(
+                redis, user_id=payload.user_id, event="expired",
+                order_id=payload.order_id, symbol=payload.symbol,
+                side=payload.side, type=payload.type,
+                status=OrderStatus.EXPIRED.value,
+            )
+
         # 7. If taker has remaining qty and is LIMIT/POST_ONLY/ICEBERG → insert as resting
         if remaining > 0 and payload.type in ("limit", "post_only", "iceberg"):
             logger.info(
@@ -502,6 +535,68 @@ class MatchingWorker:
 
         return result
 
+    async def _finalize_not_executed(
+        self,
+        payload: OrderActionPayload,
+        status_val: OrderStatus,
+        reason: str,
+    ) -> None:
+        """Close a taker row the engine refused or partially executed (IOC).
+
+        The API locked funds at placement and cannot know the async outcome;
+        without this, rejected post_only/FOK orders and IOC remainders sit
+        in 'new'/'partially_filled' holding locked balances while being
+        absent from the book — invisible, unmatchable, money stuck.
+        Pessimistic row lock: safe against concurrent user cancels (the
+        cancel path's FOR UPDATE serializes with us; whoever runs second
+        sees the closed row and no-ops).
+        """
+        redis = self._redis
+        closed = False
+        try:
+            async with async_session_factory() as session:
+                async with session.begin():
+                    order = await OrderRepository(session).get_for_update(payload.order_id)
+                    if order is None or order.status not in (
+                        OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED,
+                    ):
+                        return
+                    unlock = order.locked_amount or Decimal("0")
+                    if unlock > 0:
+                        pair = await TradingPairRepository(session).get_by_symbol(order.symbol)
+                        if pair is not None:
+                            asset = (pair.quote_asset if order.side == OrderSide.BUY
+                                     else pair.base_asset)
+                            bal_svc = BalanceService(session)
+                            bal = await bal_svc.repo.get_for_update(order.user_id, asset)
+                            if bal is not None:
+                                actual = min(unlock, bal.locked_balance)
+                                if actual > 0:
+                                    await bal_svc.unlock_pessimistic(
+                                        bal, actual, reason="order_rejected",
+                                        order_id=order.id,
+                                    )
+                    order.locked_amount = Decimal("0")
+                    order.status = status_val
+                    order.version += 1
+                    closed = True
+        except Exception:
+            logger.exception("finalize_not_executed failed for order %d", payload.order_id)
+            return
+
+        if closed:
+            # The API registered index + HASH at placement; the order will
+            # never rest, so drop them (book ZSET was never written for a
+            # taker that did not rest).
+            try:
+                await orders_index.remove_open_order(
+                    redis, payload.user_id, payload.symbol, payload.order_id,
+                )
+                await orderbook.delete_order_hash(redis, payload.order_id)
+            except Exception:
+                logger.exception("finalize_not_executed redis cleanup failed for %d",
+                                 payload.order_id)
+
     async def _insert_resting_taker(self, payload: OrderActionPayload, remaining: float) -> None:
         """Insert a partially-filled taker as a new resting order in the book.
 
@@ -521,9 +616,10 @@ class MatchingWorker:
             "side": payload.side,
             "type": payload.type,
             "price": str(payload.price) if payload.price else "",
-            "quantity": str(remaining),  # ← remaining, NOT payload.quantity
-            "visible_quantity": str(payload.visible_qty) if payload.is_iceberg else str(remaining),
-            "hidden_quantity": str(payload.hidden_qty) if payload.is_iceberg else "",
+            "quantity": _quant(remaining),  # ← remaining, NOT payload.quantity
+            "visible_quantity": (_quant(payload.visible_qty) if payload.is_iceberg
+                                 else _quant(remaining)),
+            "hidden_quantity": (_quant(payload.hidden_qty) if payload.is_iceberg else ""),
             "is_iceberg": "1" if payload.is_iceberg else "0",
         }
         await orderbook.store_order_hash(redis, payload.order_id, metadata)
@@ -534,7 +630,7 @@ class MatchingWorker:
             symbol=payload.symbol,
             side=payload.side,
             price=Decimal(str(payload.price)) if payload.price else Decimal("0"),
-            quantity=Decimal(str(remaining)),
+            quantity=Decimal(_quant(remaining)),
         )
         await orders_index.add_open_order(redis, payload.user_id, payload.symbol, payload.order_id)
 
