@@ -62,3 +62,13 @@ Remaining known issues (unfixed, measured):
 * BalanceVersionConflict → occasional 500 on concurrent same-account POSTs
   (1/400); should be 409 or per-account queue.
 * Worker sleeps 1s per dead-lettered action (poison backlog stall).
+
+## Clean rebuild verification (down + build --no-cache + up)
+All 6 containers rebuilt from repo @ fa12041; fix presence verified inside
+images (post_commit imports, worker requeue constant, frontend bundle).
+* Cython microbench: mean 0.44us, p50 0.42us, p99 0.55us, GIL released.
+* P1 REST read: 241 req/s, p50 32ms.
+* P2 REST write: 89 req/s, p50 43ms, 1x500 (known BalanceVersionConflict).
+* P3 E2E: 100/100 filled, 200/200 trades, 50/50 order events per user,
+  refused=0, requeued=0, worker errors=0.
+* WS burst tail (real, unfixed): e2e p50 1314ms, p99 2102ms.
