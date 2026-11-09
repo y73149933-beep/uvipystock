@@ -13,6 +13,7 @@ export function useOrderbookFeed(symbol: string) {
   const socketRef = useRef<PublicSocket | null>(null);
   const applySnapshot = useOrderbookStore((s) => s.applySnapshot);
   const applyUpdate = useOrderbookStore((s) => s.applyUpdate);
+  const applyTradeOptimistic = useOrderbookStore((s) => s.applyTradeOptimistic);
   const addTrade = useTradesStore((s) => s.addTrade);
   const updateLastPrice = useChartStore((s) => s.updateLastPrice);
   const addTradeToCandle = useChartStore((s) => s.addTradeToCandle);
@@ -38,6 +39,7 @@ export function useOrderbookFeed(symbol: string) {
           break;
         case "trade":
           addTrade(msg);
+          applyTradeOptimistic(msg.price, msg.quantity, msg.side);
           updateLastPrice(msg.price);
           addTradeToCandle(msg.price, msg.quantity);
           break;
@@ -51,5 +53,5 @@ export function useOrderbookFeed(symbol: string) {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [symbol, applySnapshot, applyUpdate, addTrade, updateLastPrice, addTradeToCandle, fetchLadder]);
+  }, [symbol, applySnapshot, applyUpdate, applyTradeOptimistic, addTrade, updateLastPrice, addTradeToCandle, fetchLadder]);
 }

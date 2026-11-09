@@ -15,6 +15,7 @@ interface OrderBookState {
   setSymbol: (symbol: string) => void;
   applySnapshot: (msg: OrderBookSnapshotMsg) => void;
   applyUpdate: (msg: OrderBookUpdateMsg) => void;
+  applyTradeOptimistic: (price: number, quantity: number, takerSide: string) => void;
   clear: () => void;
 }
 
@@ -73,6 +74,32 @@ export const useOrderbookStore = create<OrderBookState>((set, get) => ({
       const spread =
         bids.length > 0 && asks.length > 0 ? asks[0].price - bids[0].price : null;
       return { bids, asks, spread };
+    });
+  },
+
+  // Optimistic L2 adjustment when a trade print arrives before the
+  // server's next book snapshot: the matching worker publishes the trade
+  // event mid-settlement, but the L2 snapshot only AFTER the DB commit, so
+  // the feed visibly lags the tape. Consume the traded qty from the visible
+  // level now; the next snapshot reconciles exactly.
+  applyTradeOptimistic: (price, quantity, takerSide) => {
+    set((state) => {
+      const side = takerSide.toLowerCase();
+      if (side !== "buy" && side !== "sell") return state;
+      // A taker BUY consumes ASK liquidity, a taker SELL consumes BID.
+      const key = side === "buy" ? "asks" : "bids";
+      const levels = state[key];
+      const idx = levels.findIndex((l) => l.price === price);
+      if (idx === -1) return state;
+      const remain = levels[idx].volume - quantity;
+      const next = levels.slice();
+      if (remain <= 0) next.splice(idx, 1);
+      else next[idx] = { ...levels[idx], volume: remain };
+      const bids = key === "asks" ? state.bids : next;
+      const asks = key === "asks" ? next : state.asks;
+      const spread =
+        bids.length > 0 && asks.length > 0 ? asks[0].price - bids[0].price : null;
+      return { [key]: next, spread } as Partial<OrderBookState>;
     });
   },
 
