@@ -6,36 +6,19 @@
  *   signing_key = sha256(raw_secret)
  *   signature  = hmac_sha256(signing_key, payload)
  *
- * We use the Web Crypto API (SubtleCrypto) which is available in all modern
- * browsers and in Node.js 18+.
+ * Uses the pure-JS `js-sha256` package: Web Crypto (SubtleCrypto) is unavailable
+ * in insecure contexts (plain http:// over a bare IP), which would otherwise
+ * break every HMAC-signed request in the browser.
  */
 
+import { sha256 } from "js-sha256";
+
 async function sha256Hex(message: string): Promise<string> {
-  const msgBuffer = new TextEncoder().encode(message);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-  return bufferToHex(hashBuffer);
+  return sha256(message);
 }
 
 async function hmacSha256Hex(key: string, message: string): Promise<string> {
-  const keyBuffer = new TextEncoder().encode(key);
-  const msgBuffer = new TextEncoder().encode(message);
-
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    keyBuffer,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-
-  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgBuffer);
-  return bufferToHex(sigBuffer);
-}
-
-function bufferToHex(buffer: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  return sha256.hmac(key, message);
 }
 
 /**
@@ -46,7 +29,7 @@ function bufferToHex(buffer: ArrayBuffer): string {
  * @param path       Request path including query string (e.g. "/api/v1/orders?limit=10")
  * @param timestamp  Unix seconds
  * @param body       Raw request body string (empty for GET)
- * @returns          Hex-encoded HMAC-SHA256 signature
+ * @returns          Hex-encoded HMAC-256 signature
  */
 export async function computeSignature(
   rawSecret: string,
