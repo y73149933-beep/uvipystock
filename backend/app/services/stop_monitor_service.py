@@ -63,6 +63,7 @@ from app.repositories.order_repo import OrderRepository
 from app.repositories.trading_pair_repo import TradingPairRepository
 from app.services.balance_service import BalanceService
 from app.services.order_service import OrderCreateDTO, OrderService
+from app.services.post_commit import defer_after_commit
 
 logger = logging.getLogger(__name__)
 
@@ -447,34 +448,62 @@ class StopMonitorService:
                 session.add(child)
                 await session.flush()
 
-                # Enqueue child order to matching worker
+                # Enqueue child order + HASH/index registration + events:
+                # all DEFERRED until after this transaction commits. The child
+                # row is invisible until commit; if the worker BRPOPs the place
+                # action early it reads MISSING and refuses the match (and a
+                # rollback would leave ghost book entries + events).
+                _cid, _csym = child.id, child.symbol
+                _cuser, _cside_s, _ctype = child.user_id, child.side.value, child.type.value
+                _cprice, _cqty = (float(child.price) if child.price else None), float(child.quantity)
+                _cparent = order.id
                 payload = queues.build_order_action_payload(
                     action="place",
-                    order_id=child.id,
-                    symbol=child.symbol,
-                    user_id=child.user_id,
-                    side=child.side.value,
-                    type=child.type.value,
-                    price=float(child.price) if child.price else None,
-                    quantity=float(child.quantity),
-                    parent_order_id=order.id,
+                    order_id=_cid,
+                    symbol=_csym,
+                    user_id=_cuser,
+                    side=_cside_s,
+                    type=_ctype,
+                    price=_cprice,
+                    quantity=_cqty,
+                    parent_order_id=_cparent,
                 )
-                await queues.enqueue_order_action(redis, payload)
-
-                # Add to open-orders index + HASH
-                from app.redis_client import orders_index
-                await orders_index.add_open_order(redis, child.user_id, child.symbol, child.id)
                 metadata = {
-                    "order_id": str(child.id),
-                    "user_id": str(child.user_id),
-                    "symbol": child.symbol,
-                    "side": child.side.value,
-                    "type": child.type.value,
+                    "order_id": str(_cid),
+                    "user_id": str(_cuser),
+                    "symbol": _csym,
+                    "side": _cside_s,
+                    "type": _ctype,
                     "price": str(child.price) if child.price else "",
                     "quantity": str(child.quantity),
                     "is_iceberg": "0",
                 }
-                await orderbook.store_order_hash(redis, child.id, metadata)
+
+                async def _triggered_redis_effects() -> None:
+                    await queues.enqueue_order_action(redis, payload)
+
+                    # Add to open-orders index + HASH
+                    from app.redis_client import orders_index
+                    await orders_index.add_open_order(redis, _cuser, _csym, _cid)
+                    await orderbook.store_order_hash(redis, _cid, metadata)
+
+                    # Remove from stop queue
+                    if is_trailing:
+                        await stops.remove_trailing_stop(redis, order_id, order.symbol)
+                    else:
+                        await stops.remove_stop_order(redis, order_id, order.symbol)
+
+                    # Publish order triggered event
+                    await pubsub.publish_order_update(
+                        redis, user_id=order.user_id, event="triggered",
+                        order_id=order.id, symbol=order.symbol,
+                        side=order.side.value, type=order.type.value,
+                        status=order.status.value,
+                    )
+                    # Public stop-ladder visibility: the fired order left the queue
+                    await pubsub.publish_stops_changed(redis, order.symbol)
+
+                defer_after_commit(session, _triggered_redis_effects)
 
                 logger.info(
                     "[stop] order=%d TRIGGERED: %s stop=%s ref=%s → child %s %s "
@@ -483,22 +512,6 @@ class StopMonitorService:
                     child.type.value, child.side.value, child.quantity,
                     lock_asset, lock_amount,
                 )
-
-                # Remove from stop queue
-                if is_trailing:
-                    await stops.remove_trailing_stop(redis, order_id, order.symbol)
-                else:
-                    await stops.remove_stop_order(redis, order_id, order.symbol)
-
-                # Publish order triggered event
-                await pubsub.publish_order_update(
-                    redis, user_id=order.user_id, event="triggered",
-                    order_id=order.id, symbol=order.symbol,
-                    side=order.side.value, type=order.type.value,
-                    status=order.status.value,
-                )
-                # Public stop-ladder visibility: the fired order left the queue
-                await pubsub.publish_stops_changed(redis, order.symbol)
 
     async def _rescan_pending_stops(self, symbols: list[str]) -> None:
         """On startup, re-evaluate all pending stops against last trade price.

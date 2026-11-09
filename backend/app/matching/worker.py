@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
@@ -91,10 +91,18 @@ class OrderActionPayload:
     replaces_id: int | None
     bulk_id: str | None
     ts: int
+    # How many times the worker has already bounced this action back onto
+    # the queue because the referenced row was not committed yet
+    # (pre-commit race; see app/services/post_commit.py for the root fix).
+    attempt: int = 0
+    # Original wire dict (kept so requeue paths can re-enqueue with an
+    # incremented attempt without re-serializing every field). Declared as a
+    # field because the dataclass uses slots=True.
+    _raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "OrderActionPayload":
-        return cls(
+        obj = cls(
             action=d["action"],
             order_id=int(d["order_id"]),
             symbol=d["symbol"],
@@ -111,7 +119,15 @@ class OrderActionPayload:
             replaces_id=int(d["replaces_id"]) if d.get("replaces_id") else None,
             bulk_id=d.get("bulk_id"),
             ts=int(d.get("ts", 0)),
+            attempt=int(d.get("attempt", 0)),
+            _raw=d,
         )
+        return obj
+
+
+# Bounded retries for actions that reference a not-yet-committed row
+# (the enqueue-before-commit race; see app/services/post_commit.py).
+_TAKER_RACE_MAX_ATTEMPTS = 5
 
 
 class MatchingWorker:
@@ -408,10 +424,56 @@ class MatchingWorker:
                             payload.order_id, len(enriched_trades),
                         )
             except TakerOrderInvalidError as e:
+                # A MISSING taker row means the action raced the producer's
+                # transaction commit (the enqueue used to happen before the
+                # row was committed; app/services/post_commit.py removed that
+                # window, but a crash between commit and enqueue — or a slow
+                # commit — can still surface it). Bounce the action back onto
+                # the queue with a small backoff instead of stranding the
+                # order in 'new' with funds locked. Row exists but is not
+                # matchable (e.g. canceled mid-flight) → keep the old refusal.
+                if "status=MISSING" in str(e) and payload.attempt < _TAKER_RACE_MAX_ATTEMPTS:
+                    raw = dict(getattr(payload, "_raw", None) or {})
+                    if not raw:
+                        # Fallback for hand-built payloads (diagnostics):
+                        # rebuild from the dataclass fields.
+                        raw = {
+                            "action": payload.action, "order_id": payload.order_id,
+                            "symbol": payload.symbol, "user_id": payload.user_id,
+                            "side": payload.side, "type": payload.type,
+                            "price": payload.price, "stop_price": payload.stop_price,
+                            "quantity": payload.quantity, "is_iceberg": payload.is_iceberg,
+                            "visible_qty": payload.visible_qty,
+                            "hidden_qty": payload.hidden_qty,
+                            "parent_order_id": payload.parent_order_id,
+                            "replaces_id": payload.replaces_id,
+                            "bulk_id": payload.bulk_id, "ts": payload.ts,
+                        }
+                    raw["attempt"] = payload.attempt + 1
+                    await asyncio.sleep(0.05 * (payload.attempt + 1))
+                    await queues.enqueue_order_action(self._redis, raw)
+                    logger.warning(
+                        "Taker %d not visible yet (commit race?) — requeued "
+                        "(attempt %d/%d)",
+                        payload.order_id, payload.attempt + 1, _TAKER_RACE_MAX_ATTEMPTS,
+                    )
+                    return result
                 logger.error(
                     "Match for taker %d refused: %s — skipping refund/rest",
                     payload.order_id, e,
                 )
+                if "status=MISSING" in str(e):
+                    logger.error(
+                        "Taker %d still missing after %d attempts — dead-lettered; "
+                        "if the order row exists it is stranded in 'new' and needs "
+                        "manual re-drive",
+                        payload.order_id, payload.attempt,
+                    )
+                    await queues.enqueue_deadletter(
+                        self._redis, getattr(payload, "_raw", None) or {},
+                        f"taker missing after {payload.attempt} attempts",
+                        queues.ORDERS_QUEUE,
+                    )
                 return result
 
         # 7. If taker has remaining qty and is LIMIT/POST_ONLY/ICEBERG → insert as resting

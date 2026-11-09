@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,7 @@ from app.repositories.balance_repo import BalanceRepository
 from app.repositories.order_repo import OrderRepository
 from app.repositories.trade_repo import TradeRepository
 from app.services.balance_service import BalanceService
+from app.services.post_commit import defer_after_commit
 
 logger = logging.getLogger(__name__)
 
@@ -278,39 +280,52 @@ class TradeService:
 
         await self.session.flush()
 
-        # Publish trade events (public)
-        for trade in persisted:
-            await pubsub.publish_trade(
-                redis, symbol=symbol, trade_id=trade.id,
-                price=float(trade.price), quantity=float(trade.quantity),
-                side=trade.side.value,
-                taker_order_id=taker_order_id,
-                maker_order_id=trade.maker_order_id,
-            )
-
-        # Publish order updates (private, for both taker and makers)
+        # Publish trade events (public) + order updates (private) AFTER the
+        # settlement transaction commits. These are fire-and-forget pub/sub:
+        # publishing them inside the transaction means a rollback (e.g. an
+        # overfilled maker caught by a later guard) emits ghost fills that
+        # clients can never un-see. All scalars are captured now; the
+        # deferred task performs only Redis calls.
+        # See app/services/post_commit.py.
+        trade_publish_args = [
+            dict(symbol=symbol, trade_id=trade.id,
+                 price=float(trade.price), quantity=float(trade.quantity),
+                 side=trade.side.value,
+                 taker_order_id=taker_order_id,
+                 maker_order_id=trade.maker_order_id)
+            for trade in persisted
+        ]
+        order_publish_args = []
         if taker_order is not None:
             event = "filled" if taker_order.status == OrderStatus.FILLED else "partially_filled"
-            await pubsub.publish_order_update(
-                redis, user_id=taker_user_id, event=event,
+            order_publish_args.append(dict(
+                user_id=taker_user_id, event=event,
                 order_id=taker_order.id, symbol=taker_order.symbol,
                 side=taker_order.side.value, type=taker_order.type.value,
                 status=taker_order.status.value,
                 filled_quantity=float(taker_order.filled_quantity),
                 remaining_quantity=float(taker_order.remaining_quantity),
                 avg_fill_price=float(taker_order.avg_fill_price) if taker_order.avg_fill_price else None,
-            )
+            ))
         for maker_id, mo in maker_orders.items():
             event = "filled" if mo.status == OrderStatus.FILLED else "partially_filled"
-            await pubsub.publish_order_update(
-                redis, user_id=mo.user_id, event=event,
+            order_publish_args.append(dict(
+                user_id=mo.user_id, event=event,
                 order_id=mo.id, symbol=mo.symbol,
                 side=mo.side.value, type=mo.type.value,
                 status=mo.status.value,
                 filled_quantity=float(mo.filled_quantity),
                 remaining_quantity=float(mo.remaining_quantity),
                 avg_fill_price=float(mo.avg_fill_price) if mo.avg_fill_price else None,
-            )
+            ))
+
+        async def _publish_fill_events() -> None:
+            for kwargs in trade_publish_args:
+                await pubsub.publish_trade(redis, **kwargs)
+            for kwargs in order_publish_args:
+                await pubsub.publish_order_update(redis, **kwargs)
+
+        defer_after_commit(self.session, _publish_fill_events)
 
         return persisted
 
@@ -463,56 +478,84 @@ class TradeService:
                 OrderType.STOP_MARKET, OrderType.STOP_LIMIT,
             )
 
-            if is_conditional:
-                # Arm the conditional child: stays PENDING until its stop
-                # trigger fires (the monitor only converts PENDING rows).
-                await stops.add_stop_order(
-                    redis, order_id=child.id, symbol=child.symbol,
-                    stop_price=child.stop_price or Decimal("0"),
-                )
-            else:
+            # Capture scalars now; register the Redis effects to run after
+            # this settlement transaction commits (worker must never see a
+            # place action for an uncommitted child row — see post_commit.py).
+            _cid, _csym = child.id, child.symbol
+            _cuser, _cside_s, _ctype = child.user_id, child.side.value, child.type.value
+            _cprice = float(child.price) if child.price else None
+            _cqty = float(child.quantity)
+            _cstop = child.stop_price or Decimal("0")
+            _cparent = parent_order.id
+
+            if not is_conditional:
                 # Plain child → straight to the matching engine.
                 child.status = OrderStatus.NEW
-                payload = queues.build_order_action_payload(
+                _payload = queues.build_order_action_payload(
                     action="place",
-                    order_id=child.id,
-                    symbol=child.symbol,
-                    user_id=child.user_id,
-                    side=child.side.value,
-                    type=child.type.value,
-                    price=float(child.price) if child.price else None,
-                    quantity=float(child.quantity),
-                    parent_order_id=parent_order.id,
+                    order_id=_cid,
+                    symbol=_csym,
+                    user_id=_cuser,
+                    side=_cside_s,
+                    type=_ctype,
+                    price=_cprice,
+                    quantity=_cqty,
+                    parent_order_id=_cparent,
                 )
-                await queues.enqueue_order_action(redis, payload)
+            else:
+                _payload = None
 
-            # Shared registration (both branches). Without the HASH a
-            # conditional child is a phantom in the trigger scan (skipped,
-            # never fires) and a resting TP child settles under user 0.
-            await orders_index.add_open_order(redis, child.user_id, child.symbol, child.id)
-            await orderbook.store_order_hash(redis, child.id, {
-                "order_id": str(child.id),
-                "user_id": str(child.user_id),
-                "symbol": child.symbol,
-                "side": child.side.value,
-                "type": child.type.value,
+            _hash_meta = {
+                "order_id": str(_cid),
+                "user_id": str(_cuser),
+                "symbol": _csym,
+                "side": _cside_s,
+                "type": _ctype,
                 "price": str(child.price) if child.price else "",
                 "stop_price": str(child.stop_price) if child.stop_price else "",
                 "quantity": str(child.quantity),
                 "is_iceberg": "0",
-            })
+            }
+            _is_cond = is_conditional
+
+            # Default-args bind THIS iteration's values (a plain closure
+            # would see the last child's ids after the loop ends).
+            async def _child_redis_effects(
+                cond=_is_cond, cid=_cid, csym=_csym, cuser=_cuser,
+                cstop=_cstop, payload_=_payload, meta_=_hash_meta,
+            ) -> None:
+                if cond:
+                    # Arm the conditional child: stays PENDING until its stop
+                    # trigger fires (the monitor only converts PENDING rows).
+                    await stops.add_stop_order(
+                        redis, order_id=cid, symbol=csym, stop_price=cstop,
+                    )
+                else:
+                    await queues.enqueue_order_action(redis, payload_)
+
+                # Shared registration (both branches). Without the HASH a
+                # conditional child is a phantom in the trigger scan (skipped,
+                # never fires) and a resting TP child settles under user 0.
+                await orders_index.add_open_order(redis, cuser, csym, cid)
+                await orderbook.store_order_hash(redis, cid, meta_)
+
+            defer_after_commit(self.session, _child_redis_effects)
             child.version += 1
 
-            # Publish SL/TP activation event
-            await pubsub.publish_sl_tp_activated(
-                redis, user_id=child.user_id,
-                parent_order_id=parent_order.id,
-                sl_order_id=parent_order.sl_order_id,
-                tp_order_id=parent_order.tp_order_id,
-            )
-            if is_conditional:
+            # Publish SL/TP activation event (after commit — real activation only)
+            _sl_id, _tp_id = parent_order.sl_order_id, parent_order.tp_order_id
+            defer_after_commit(self.session, partial(
+                pubsub.publish_sl_tp_activated, redis,
+                user_id=_cuser,
+                parent_order_id=_cparent,
+                sl_order_id=_sl_id,
+                tp_order_id=_tp_id,
+            ))
+            if _is_cond:
                 # Public stop-ladder visibility: this level just appeared
-                await pubsub.publish_stops_changed(redis, child.symbol)
+                defer_after_commit(
+                    self.session, partial(pubsub.publish_stops_changed, redis, _csym),
+                )
 
 
 __all__ = [

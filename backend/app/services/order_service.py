@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import uuid
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,6 +61,7 @@ from app.services.balance_service import (
     BalanceService,
     InsufficientBalanceError,
 )
+from app.services.post_commit import defer_after_commit
 
 logger = logging.getLogger(__name__)
 
@@ -377,10 +379,19 @@ class OrderService:
 
         await self.session.flush()
 
-        # Enqueue action to matching worker (or stop queue)
+        # Redis side effects (queue push, open-orders index, order HASH,
+        # pub/sub events) are DEFERRED until after the DB COMMIT.
+        # Enqueuing before commit raced the matching worker: it BRPOPed the
+        # place action, read the taker row as MISSING (uncommitted INSERT),
+        # refused the match and stranded the order in 'new' with funds locked.
+        # Same rationale for publish: pub/sub is fire-and-forget, a rollback
+        # after publish leaves ghost events clients can never un-see.
+        # See app/services/post_commit.py.
         redis = get_redis()
         if is_stop:
-            await self._register_stop_order(redis, order, dto)
+            defer_after_commit(
+                self.session, partial(self._register_stop_order, redis, order, dto),
+            )
         else:
             payload = queues.build_order_action_payload(
                 action="place",
@@ -397,10 +408,6 @@ class OrderService:
                 parent_order_id=None,
                 bulk_id=order.bulk_id,
             )
-            await queues.enqueue_order_action(redis, payload)
-
-            # Also add to Redis open-orders index + order HASH
-            await orders_index.add_open_order(redis, user_id, order.symbol, order.id)
             metadata = {
                 "order_id": str(order.id),
                 "user_id": str(user_id),
@@ -413,11 +420,15 @@ class OrderService:
                 "hidden_quantity": str(order.hidden_quantity) if order.hidden_quantity else "",
                 "is_iceberg": "1" if order.type == OrderType.ICEBERG else "0",
             }
-            await orderbook.store_order_hash(redis, order.id, metadata)
+            defer_after_commit(
+                self.session,
+                partial(self._place_redis_effects, redis, user_id, payload, metadata),
+            )
 
-        # Publish order event
-        await pubsub.publish_order_update(
-            redis, user_id=user_id,
+        # Publish order event (deferred; runs after commit)
+        defer_after_commit(self.session, partial(
+            pubsub.publish_order_update, redis,
+            user_id=user_id,
             event="placed" if not is_stop else "pending",
             order_id=order.id, symbol=order.symbol,
             side=order.side.value, type=order.type.value,
@@ -426,9 +437,25 @@ class OrderService:
             quantity=float(order.quantity),
             client_order_id=dto.client_order_id,
             bulk_id=order.bulk_id,
-        )
+        ))
 
         return order
+
+    async def _place_redis_effects(
+        self,
+        redis,
+        user_id: int,
+        payload: dict[str, Any],
+        metadata: dict[str, str],
+    ) -> None:
+        """Post-commit Redis mutations for a freshly placed order.
+
+        Order matters: enqueue first (worker only matches rows that are
+        already committed by definition now), then index + HASH.
+        """
+        await queues.enqueue_order_action(redis, payload)
+        await orders_index.add_open_order(redis, user_id, payload["symbol"], payload["order_id"])
+        await orderbook.store_order_hash(redis, payload["order_id"], metadata)
 
     async def _create_sltp_child(
         self,
@@ -582,54 +609,67 @@ class OrderService:
         # Cancel SL/TP children
         await self.repo.cancel_children(order.id)
 
-        # Redis cleanup
+        # Redis cleanup — ALL deferred until after commit (see post_commit.py):
+        # if this transaction rolls back, the order must stay on the book and
+        # no ghost 'canceled' event may reach the client. Values are captured
+        # now (pre-commit) so the deferred task needs no live ORM state.
         redis = get_redis()
-        if is_stop:
-            if order.type == OrderType.TRAILING_STOP:
-                await stops.remove_trailing_stop(redis, order.id, order.symbol)
+        _oid, _sym, _side = order.id, order.symbol, order.side
+        _price = order.price or Decimal("0")
+        _type = order.type.value
+        _side_s = order.side.value
+        _filled = float(order.filled_quantity)
+        _is_stop = is_stop
+        _is_trailing = order.type == OrderType.TRAILING_STOP
+
+        async def _cancel_redis_effects() -> None:
+            if _is_stop:
+                if _is_trailing:
+                    await stops.remove_trailing_stop(redis, _oid, _sym)
+                else:
+                    await stops.remove_stop_order(redis, _oid, _sym)
             else:
-                await stops.remove_stop_order(redis, order.id, order.symbol)
-        else:
-            await orderbook.remove_resting_order(
-                redis, order.id, order.symbol, order.side,
-                order.price or Decimal("0"), 0,
+                await orderbook.remove_resting_order(
+                    redis, _oid, _sym, _side, _price, 0,
+                )
+                await orderbook.delete_order_hash(redis, _oid)
+            await orders_index.remove_open_order(redis, user_id, _sym, _oid)
+
+            if _is_stop:
+                # Public stop-ladder visibility: the level lost volume/vanished
+                await pubsub.publish_stops_changed(redis, _sym)
+
+            # Enqueue cancel action (so matching worker can skip in-flight matches)
+            payload = queues.build_order_action_payload(
+                action="cancel",
+                order_id=_oid,
+                symbol=_sym,
+                user_id=user_id,
+                side=_side_s,
+                type=_type,
             )
-            await orderbook.delete_order_hash(redis, order.id)
-        await orders_index.remove_open_order(redis, user_id, order.symbol, order.id)
+            await queues.enqueue_order_action(redis, payload)
 
-        if is_stop:
-            # Public stop-ladder visibility: the level lost volume/vanished
-            await pubsub.publish_stops_changed(redis, order.symbol)
+            await pubsub.publish_order_update(
+                redis, user_id=user_id, event="canceled",
+                order_id=_oid, symbol=_sym,
+                side=_side_s, type=_type,
+                status=OrderStatus.CANCELED.value,
+                filled_quantity=_filled,
+                remaining_quantity=0.0,
+            )
 
-        # Enqueue cancel action (so matching worker can skip in-flight matches)
-        payload = queues.build_order_action_payload(
-            action="cancel",
-            order_id=order.id,
-            symbol=order.symbol,
-            user_id=user_id,
-            side=order.side.value,
-            type=order.type.value,
-        )
-        await queues.enqueue_order_action(redis, payload)
+            # Publish orderbook snapshot so the frontend updates the order book
+            # immediately after an order is removed (not just on new trades).
+            # Read AFTER the removal above → snapshot reflects truth.
+            snap = await orderbook.get_book_snapshot(redis, _sym, depth=20)
+            await pubsub.publish_orderbook_snapshot(
+                redis, _sym,
+                bids=[[p, q] for p, q in snap["bids"]],
+                asks=[[p, q] for p, q in snap["asks"]],
+            )
 
-        # Publish events
-        await pubsub.publish_order_update(
-            redis, user_id=user_id, event="canceled",
-            order_id=order.id, symbol=order.symbol,
-            side=order.side.value, type=order.type.value,
-            status=OrderStatus.CANCELED.value,
-            filled_quantity=float(order.filled_quantity),
-            remaining_quantity=0.0,
-        )
-
-        # Publish orderbook snapshot so the frontend updates the order book
-        # immediately after an order is removed (not just on new trades).
-        snap = await orderbook.get_book_snapshot(redis, order.symbol, depth=20)
-        await pubsub.publish_orderbook_snapshot(
-            redis, order.symbol,
-            bids=[[p, q] for p, q in snap["bids"]],
-            asks=[[p, q] for p, q in snap["asks"]],
-        )
+        defer_after_commit(self.session, _cancel_redis_effects)
 
         # Reload to get final state
         await self.session.refresh(order)
@@ -751,17 +791,22 @@ class OrderService:
         old_order.replaced_by_id = new_order.id
         await self.session.flush()
 
-        # 5. Redis updates: remove old, add new
+        # 5-7. Redis updates + worker actions + events — ALL deferred until
+        # after commit (see post_commit.py). Values captured now; the new
+        # order row MUST be committed before the worker may see its action.
         redis = get_redis()
-        await orderbook.remove_resting_order(
-            redis, old_order.id, old_order.symbol, old_order.side,
-            old_order.price or Decimal("0"), 0,
-        )
-        await orderbook.delete_order_hash(redis, old_order.id)
-        await orders_index.remove_open_order(redis, user_id, old_order.symbol, old_order.id)
-
-        # Add new to book + index
-        await orders_index.add_open_order(redis, user_id, new_order.symbol, new_order.id)
+        _old_id, _new_id = old_order.id, new_order.id
+        _sym, _old_side, _old_side_s = old_order.symbol, old_order.side, old_order.side.value
+        _old_price = old_order.price or Decimal("0")
+        _old_type = old_order.type.value
+        _new_side_s = new_order.side.value
+        _new_type = new_order.type.value
+        _new_price = new_order.price
+        _new_quantity = new_order.quantity
+        _new_status = new_order.status.value
+        _is_iceberg = new_order.type == OrderType.ICEBERG
+        _vis = float(new_order.visible_quantity) if new_order.visible_quantity else None
+        _hid = float(new_order.hidden_quantity) if new_order.hidden_quantity else None
         metadata = {
             "order_id": str(new_order.id),
             "user_id": str(user_id),
@@ -774,50 +819,63 @@ class OrderService:
             "hidden_quantity": str(new_order.hidden_quantity) if new_order.hidden_quantity else "",
             "is_iceberg": "1" if new_order.type == OrderType.ICEBERG else "0",
         }
-        await orderbook.store_order_hash(redis, new_order.id, metadata)
 
-        # 6. Enqueue worker actions.
-        # The worker pipeline understands "place" end-to-end (match → settle
-        # → rest remainder). A dedicated "modify" action was never implemented
-        # there — the new order stayed NEW forever, invisible to matching while
-        # its funds stayed locked. So we enqueue the new order as a regular
-        # placement, preceded by a cancel no-op for the old id (ack'ed by the
-        # worker) to keep in-flight pipelines consistent.
-        cancel_payload = queues.build_order_action_payload(
-            action="cancel",
-            order_id=old_order.id,
-            symbol=old_order.symbol,
-            user_id=user_id,
-            side=old_order.side.value,
-            type=old_order.type.value,
-        )
-        await queues.enqueue_order_action(redis, cancel_payload)
+        async def _modify_redis_effects() -> None:
+            # Remove old from book + index
+            await orderbook.remove_resting_order(
+                redis, _old_id, _sym, _old_side, _old_price, 0,
+            )
+            await orderbook.delete_order_hash(redis, _old_id)
+            await orders_index.remove_open_order(redis, user_id, _sym, _old_id)
 
-        payload = queues.build_order_action_payload(
-            action="place",
-            order_id=new_order.id,
-            symbol=new_order.symbol,
-            user_id=user_id,
-            side=new_order.side.value,
-            type=new_order.type.value,
-            price=float(new_order.price) if new_order.price else None,
-            quantity=float(new_order.quantity),
-            is_iceberg=(new_order.type == OrderType.ICEBERG),
-            visible_qty=float(new_order.visible_quantity) if new_order.visible_quantity else None,
-            hidden_qty=float(new_order.hidden_quantity) if new_order.hidden_quantity else None,
-            replaces_id=old_order.id,
-        )
-        await queues.enqueue_order_action(redis, payload)
+            # Add new to book + index
+            await orders_index.add_open_order(redis, user_id, _sym, _new_id)
+            await orderbook.store_order_hash(redis, _new_id, metadata)
 
-        # 7. Publish events
-        await pubsub.publish_order_update(
-            redis, user_id=user_id, event="modified",
-            order_id=new_order.id, symbol=new_order.symbol,
-            side=new_order.side.value, type=new_order.type.value,
-            status=new_order.status.value,
-            price=float(new_order.price),
-            quantity=float(new_order.quantity),
-        )
+            # 6. Enqueue worker actions.
+            # The worker pipeline understands "place" end-to-end (match → settle
+            # → rest remainder). A dedicated "modify" action was never implemented
+            # there — the new order stayed NEW forever, invisible to matching while
+            # its funds stayed locked. So we enqueue the new order as a regular
+            # placement, preceded by a cancel no-op for the old id (ack'ed by the
+            # worker) to keep in-flight pipelines consistent.
+            cancel_payload = queues.build_order_action_payload(
+                action="cancel",
+                order_id=_old_id,
+                symbol=_sym,
+                user_id=user_id,
+                side=_old_side_s,
+                type=_old_type,
+            )
+            await queues.enqueue_order_action(redis, cancel_payload)
+
+            payload = queues.build_order_action_payload(
+                action="place",
+                order_id=_new_id,
+                symbol=_sym,
+                user_id=user_id,
+                side=_new_side_s,
+                type=_new_type,
+                price=float(_new_price) if _new_price else None,
+                quantity=float(_new_quantity),
+                is_iceberg=_is_iceberg,
+                visible_qty=_vis,
+                hidden_qty=_hid,
+                replaces_id=_old_id,
+            )
+            await queues.enqueue_order_action(redis, payload)
+
+            # 7. Publish events
+            await pubsub.publish_order_update(
+                redis, user_id=user_id, event="modified",
+                order_id=_new_id, symbol=_sym,
+                side=_new_side_s, type=_new_type,
+                status=_new_status,
+                price=float(_new_price),
+                quantity=float(_new_quantity),
+            )
+
+        defer_after_commit(self.session, _modify_redis_effects)
 
         return new_order
 
@@ -938,7 +996,9 @@ class OrderService:
 
             # Redis registration
             if is_stop:
-                await self._register_stop_order(redis, order, dto)
+                defer_after_commit(
+                    self.session, partial(self._register_stop_order, redis, order, dto),
+                )
             else:
                 payload = queues.build_order_action_payload(
                     action="place",
@@ -954,8 +1014,6 @@ class OrderService:
                     hidden_qty=float(order.hidden_quantity) if order.hidden_quantity else None,
                     bulk_id=bulk_id,
                 )
-                await queues.enqueue_order_action(redis, payload)
-                await orders_index.add_open_order(redis, user_id, order.symbol, order.id)
                 metadata = {
                     "order_id": str(order.id),
                     "user_id": str(user_id),
@@ -969,13 +1027,20 @@ class OrderService:
                     "is_iceberg": "1" if order.type == OrderType.ICEBERG else "0",
                     "bulk_id": bulk_id,
                 }
-                await orderbook.store_order_hash(redis, order.id, metadata)
+                # Deferred to after the single bulk COMMIT — per-order enqueue
+                # before commit would race the worker exactly like the
+                # single-place path did.
+                defer_after_commit(
+                    self.session,
+                    partial(self._place_redis_effects, redis, user_id, payload, metadata),
+                )
 
-        # 4. Publish bulk success
-        await pubsub.publish_bulk_result(
+        # 4. Publish bulk success (after commit — the orders must be real)
+        defer_after_commit(self.session, partial(
+            pubsub.publish_bulk_result,
             redis, user_id, bulk_id, action="place",
             total=len(dtos), succeeded=len(orders), failed=[],
-        )
+        ))
 
         return orders
 
@@ -1028,12 +1093,13 @@ class OrderService:
             except OrderNotCancelableError as e:
                 failed.append({"index": oid, "code": "not_cancelable", "message": str(e)})
 
-        # Publish bulk cancel result
-        await pubsub.publish_bulk_result(
+        # Publish bulk cancel result (after commit)
+        defer_after_commit(self.session, partial(
+            pubsub.publish_bulk_result,
             redis, user_id, str(uuid.uuid4()), action="cancel",
             total=len(ids_to_cancel), succeeded=len(canceled),
             failed=failed,
-        )
+        ))
 
         return canceled
 
