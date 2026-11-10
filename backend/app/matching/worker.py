@@ -336,6 +336,7 @@ class MatchingWorker:
                 is_iceberg=mo["is_iceberg"],
                 visible_qty=mo["visible_quantity"],
                 hidden_qty=mo["hidden_quantity"],
+                user_id=mo.get("user_id") or 0,  # self-trade prevention
             )
             if not ok:
                 logger.warning("Failed to add maker %d to engine (pool full?)", mo["order_id"])
@@ -351,6 +352,7 @@ class MatchingWorker:
             is_iceberg=payload.is_iceberg,
             visible_qty=payload.visible_qty,
             hidden_qty=payload.hidden_qty,
+            user_id=payload.user_id,
         )
 
         # 4. Match!
@@ -423,6 +425,16 @@ class MatchingWorker:
                         for t in trades:
                             maker_hash = await orderbook.get_order_hash(redis, t["maker_order_id"])
                             maker_user_id = int(maker_hash.get("user_id", "0")) if maker_hash else 0
+                            if maker_user_id == payload.user_id:
+                                # Belt-and-braces self-trade prevention: the
+                                # engine already skips same-user makers, so
+                                # this only fires on book/HASH corruption.
+                                logger.error(
+                                    "[stp] dropping self-trade taker=%d maker=%d "
+                                    "(engine/HASH inconsistency)",
+                                    payload.order_id, t["maker_order_id"],
+                                )
+                                continue
                             enriched_t = trade_dict_to_domain(t, payload.symbol)
                             enriched_t["maker_user_id"] = maker_user_id
                             enriched_trades.append(enriched_t)
@@ -493,6 +505,25 @@ class MatchingWorker:
                         f"taker missing after {payload.attempt} attempts",
                         queues.ORDERS_QUEUE,
                     )
+                return result
+            except ValueError as e:
+                # Settlement integrity guard tripped (e.g. the book moved
+                # beyond the lock buffer between placement and match). The
+                # whole settle transaction rolled back: close the order and
+                # release its reservation instead of stranding it in 'new'
+                # with funds locked forever.
+                logger.exception(
+                    "[settle] order=%d settlement rejected (%s) — closing row, "
+                    "releasing reservation", payload.order_id, e,
+                )
+                await self._finalize_not_executed(payload, OrderStatus.EXPIRED,
+                                                  reason="settle_rejected")
+                await pubsub.publish_order_update(
+                    redis, user_id=payload.user_id, event="expired",
+                    order_id=payload.order_id, symbol=payload.symbol,
+                    side=payload.side, type=payload.type,
+                    status=OrderStatus.EXPIRED.value,
+                )
                 return result
 
         # 6b. IOC with remaining quantity: the remainder neither rests on the

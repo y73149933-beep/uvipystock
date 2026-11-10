@@ -104,11 +104,14 @@ def build_corder(
     is_iceberg: bool = False,
     visible_qty: Decimal | float | None = None,
     hidden_qty: Decimal | float | None = None,
+    user_id: int = 0,
 ) -> PyCOrder:
     """Construct a `PyCOrder` wrapper from Python-typed arguments.
 
     For market orders, `price` should be None (becomes NaN inside COrder).
     For iceberg orders, both `visible_qty` and `hidden_qty` must be provided.
+    `user_id` enables self-trade prevention in the matcher (0 = unknown owner,
+    self-matching not prevented for that order).
     """
     cdef_side = to_c_side(side)
     cdef_type = to_c_type(order_type)
@@ -143,6 +146,7 @@ def build_corder(
         is_iceberg=1 if is_iceberg else 0,
         visible_qty=vis_d,
         hidden_qty=hid_d,
+        user_id=user_id,
     )
     return c
 

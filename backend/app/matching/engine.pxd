@@ -50,6 +50,7 @@ cdef enum CMatchOutcome:
 
 cdef struct OrderNode:
     int64_t     order_id
+    int64_t     user_id           # owner (0 = unknown/legacy; never STP-skipped)
     double      remaining_qty     # what's left to fill (incl. hidden for iceberg)
     double      visible_qty       # currently visible portion (== remaining for non-iceberg)
     int         is_iceberg        # 0 / 1
@@ -74,6 +75,7 @@ cdef struct OrderBookSide:
 # Incoming order to match (taker) or insert (maker).
 cdef struct COrder:
     int64_t  order_id
+    int64_t  user_id              # owner (0 = unknown; disables STP skip for this taker)
     int      side                 # CSide
     int      type                 # CType
     double   price                # limit price (NaN for market)
@@ -110,7 +112,8 @@ cdef class PyCOrder:
     cpdef COrder get_c(self)
     cpdef void _set(self, int64_t order_id, int side, int type,
                     double price, double quantity, double remaining_qty,
-                    int is_iceberg, double visible_qty, double hidden_qty)
+                    int is_iceberg, double visible_qty, double hidden_qty,
+                    int64_t user_id=?)
 
     # Read-only Python properties are declared in the .pyx (Cython supports
     # @property on cdef class methods without .pxd declarations).
@@ -171,7 +174,8 @@ cdef class CMatchingEngine:
 
     cpdef bint add_passive_order(self, int64_t order_id, int side, double price,
                                   double qty, bint is_iceberg,
-                                  double visible_qty, double hidden_qty) except -1
+                                  double visible_qty, double hidden_qty,
+                                  int64_t user_id=?) except -1
 
     cpdef tuple match_active_order(self, PyCOrder incoming)
     """Run taker matching.

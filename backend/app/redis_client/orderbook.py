@@ -410,6 +410,7 @@ async def get_opposite_orders_for_match(
         is_iceberg = h.get(b"is_iceberg", b"0") == b"1"
         result.append({
             "order_id": order_id,
+            "user_id": int(h.get(b"user_id") or b"0"),
             "side": (h.get(b"side") or b"").decode(),
             "price": price,
             "quantity": float(h.get(b"quantity") or b"0"),

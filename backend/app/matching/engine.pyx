@@ -58,8 +58,10 @@ cdef class PyCOrder:
 
     cpdef void _set(self, int64_t order_id, int side, int type,
                     double price, double quantity, double remaining_qty,
-                    int is_iceberg, double visible_qty, double hidden_qty):
+                    int is_iceberg, double visible_qty, double hidden_qty,
+                    int64_t user_id=0):
         self.c_val.order_id       = order_id
+        self.c_val.user_id        = user_id
         self.c_val.side           = side
         self.c_val.type           = type
         self.c_val.price          = price
@@ -73,6 +75,10 @@ cdef class PyCOrder:
     @property
     def order_id(self) -> int:
         return self.c_val.order_id
+
+    @property
+    def user_id(self) -> int:
+        return self.c_val.user_id
 
     @property
     def side(self) -> int:
@@ -355,7 +361,8 @@ cdef class CMatchingEngine:
 
     cpdef bint add_passive_order(self, int64_t order_id, int side, double price,
                                   double qty, bint is_iceberg,
-                                  double visible_qty, double hidden_qty) except -1:
+                                  double visible_qty, double hidden_qty,
+                                  int64_t user_id=0) except -1:
         """Insert a resting order into the book.
 
         For iceberg orders: `qty` is the *total* quantity (visible + hidden),
@@ -379,6 +386,7 @@ cdef class CMatchingEngine:
             return False  # pool exhausted
 
         node.order_id = order_id
+        node.user_id = user_id
         node.remaining_qty = qty
         node.visible_qty = visible_qty if is_iceberg else qty
         node.is_iceberg = 1 if is_iceberg else 0
@@ -511,22 +519,37 @@ cdef class CMatchingEngine:
     # ─── Internal: pre-checks ───────────────────────────────────────────────
 
     cdef int _would_cross(self, COrder* incoming) noexcept nogil:
-        """Return 1 if a buy with `price` would cross the best ask
-        (or a sell with `price` would cross the best bid), else 0.
+        """Return 1 if a buy with `price` would cross a FOREIGN ask
+        (or a sell with `price` would cross a foreign bid), else 0.
 
         Used by Post-Only to reject orders that would take liquidity.
+        Under Self-Trade Prevention, levels composed entirely of the
+        taker's own orders do NOT count as crossing — the taker would
+        never match them anyway, so post-only should rest, not reject.
         """
         cdef OrderBookSide* opp
         if incoming.side == C_BUY:
             opp = &self._asks
-            if opp.size == 0:
-                return 0
-            return 1 if incoming.price >= opp.levels[0].price else 0
         else:
             opp = &self._bids
-            if opp.size == 0:
-                return 0
-            return 1 if incoming.price <= opp.levels[0].price else 0
+        if opp.size == 0:
+            return 0
+
+        cdef int i
+        cdef PriceLevel* lvl
+        cdef OrderNode* nd
+        for i in range(opp.size):
+            lvl = &opp.levels[i]
+            if incoming.side == C_BUY and lvl.price > incoming.price:
+                break   # further levels are priced out of the cross
+            if incoming.side == C_SELL and lvl.price < incoming.price:
+                break
+            nd = lvl.head
+            while nd != NULL:
+                if incoming.user_id == 0 or nd.user_id != incoming.user_id:
+                    return 1
+                nd = nd.next
+        return 0
 
     cdef int _precheck_fok(self, COrder* incoming) noexcept nogil:
         """Walk the opposite side and sum available volume at acceptable prices.
@@ -537,6 +560,9 @@ cdef class CMatchingEngine:
         while `bid.price >= incoming.price`.
 
         For market FOK (price == NaN), accept all available liquidity.
+
+        Under Self-Trade Prevention, the taker's own resting orders do not
+        count as fillable volume — only foreign liquidity is summed.
 
         Returns 1 if cumulative volume >= incoming.quantity, else 0.
         """
@@ -552,6 +578,7 @@ cdef class CMatchingEngine:
         cdef double cumulative = 0.0
         cdef int i
         cdef PriceLevel* lvl
+        cdef OrderNode* nd
         for i in range(opp.size):
             lvl = &opp.levels[i]
             if not isnan(incoming.price):
@@ -559,9 +586,13 @@ cdef class CMatchingEngine:
                     break
                 if incoming.side == C_SELL and lvl.price < incoming.price:
                     break
-            cumulative += lvl.total_volume
-            if cumulative >= incoming.quantity:
-                return 1
+            nd = lvl.head
+            while nd != NULL:
+                if incoming.user_id == 0 or nd.user_id != incoming.user_id:
+                    cumulative += nd.remaining_qty
+                    if cumulative >= incoming.quantity:
+                        return 1
+                nd = nd.next
         return 0
 
     # ─── Internal: the hot loop ─────────────────────────────────────────────
@@ -629,6 +660,16 @@ cdef class CMatchingEngine:
             # Walk orders at this level (FIFO — head first)
             maker = lvl.head
             while maker != NULL and incoming.remaining_qty > 0.0:
+                # ── Self-trade prevention ───────────────────────────────
+                # A taker never matches its own resting orders: the maker
+                # node stays untouched in the book and the taker proceeds
+                # to the next order at this level (and further levels).
+                # user_id == 0 means "unknown owner" (legacy/benchmark
+                # entry) and is never skipped.
+                if incoming.user_id != 0 and maker.user_id == incoming.user_id:
+                    maker = maker.next
+                    continue
+
                 fill_price = lvl.price
 
                 # How much can we take from this maker?

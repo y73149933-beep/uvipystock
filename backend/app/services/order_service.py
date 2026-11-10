@@ -252,6 +252,7 @@ class OrderService:
         self,
         dto: OrderCreateDTO,
         pair: TradingPair,
+        user_id: int,
     ) -> tuple[str, Decimal]:
         """For MARKET BUY, compute the actual cost by walking the ask side.
 
@@ -259,6 +260,11 @@ class OrderService:
         until the requested quantity is covered. The total cost = sum of
         (price * volume) at each level. If the book doesn't have enough
         volume, rejects the order.
+
+        Self-trade prevention: the taker's OWN asks are excluded from the
+        walk — the matcher will never fill against them, so counting them
+        here would under-price the lock and make the real (worse) fill
+        fail settlement with "Insufficient locked balance".
 
         A small buffer (0.1%) is added to handle race conditions where
         the book changes between lock and match.
@@ -281,6 +287,8 @@ class OrderService:
         for ask in ask_orders:
             if remaining_qty <= 0:
                 break
+            if user_id and ask.get("user_id") == user_id:
+                continue  # self-trade prevention: matcher skips these
             ask_price = Decimal(str(ask["price"]))
             ask_qty = Decimal(str(ask["visible_quantity"] if ask.get("is_iceberg") else ask["quantity"]))
 
@@ -327,7 +335,7 @@ class OrderService:
         if is_stop:
             lock_asset, lock_amount = ("", Decimal("0"))
         elif dto.type == "market" and dto.side == "buy":
-            lock_asset, lock_amount = await self._compute_market_buy_lock(dto, pair)
+            lock_asset, lock_amount = await self._compute_market_buy_lock(dto, pair, user_id)
         else:
             lock_asset, lock_amount = self._compute_lock_asset_and_amount(dto, pair)
 
@@ -939,7 +947,7 @@ class OrderService:
             if is_stop:
                 lock_asset, lock_amount = ("", Decimal("0"))
             elif dto.type == "market" and dto.side == "buy":
-                lock_asset, lock_amount = await self._compute_market_buy_lock(dto, pair)
+                lock_asset, lock_amount = await self._compute_market_buy_lock(dto, pair, user_id)
             else:
                 lock_asset, lock_amount = self._compute_lock_asset_and_amount(dto, pair)
 
