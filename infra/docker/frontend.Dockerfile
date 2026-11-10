@@ -51,10 +51,22 @@ RUN echo 'server { \
         proxy_set_header Host $host; \
     } \
     \
-    # SPA fallback \
+    # Cache policy: hashed assets forever, index.html NEVER (stale \
+    # cached index.html after a rebuild points at deleted hashed \
+    # bundles -> blank/black page) \
+    location /assets/ { \
+        root /usr/share/nginx/html; \
+        expires 1y; \
+        add_header Cache-Control "public, immutable"; \
+    } \
+    location = /index.html { \
+        root /usr/share/nginx/html; \
+        add_header Cache-Control "no-store"; \
+    } \
     location / { \
         root /usr/share/nginx/html; \
         try_files $uri $uri/ /index.html; \
+        add_header Cache-Control "no-store"; \
     } \
 }' > /etc/nginx/conf.d/default.conf
 
