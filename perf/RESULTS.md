@@ -400,3 +400,19 @@ Verified vs PG for bench1: maker row side=buy@99 renders Sell (user sold),
 buy@98 renders Buy; 50 rows -> Load older -> 100.
 Landmine again: docker -v of a non-existent /tmp file creates a ROOT-owned
 directory that blocks scp; sudo rmdir it (happened twice: perf_suite, ui_mytrades).
+
+## One-click chart trading + right-click order menu
+
+Chart widgets (authenticated users only):
+- pinned pad top-right of the chart: qty input (persisted in localStorage
+  uvity.chartQty, shared by pad AND menu) + Market Buy/Sell buttons firing
+  instantly (one-click by design); result toast under the pad, auto-clear 5s.
+- right-click anywhere on the price scale -> context menu at the cursor:
+  Buy/Sell Limit, Stop-Buy/Stop-Sell (stop_market), Market now — all at the
+  price from series.coordinateToPrice(clickY) rounded to 2dp. The menu IS
+  the confirmation layer; click-away backdrop closes it.
+
+E2E (selenium + seeded book bench2 sell2@105/buy2@90):
+pad Buy -> #28038 market filled @105; pad Sell -> #28039 filled @90;
+contextmenu at y-fraction .35 -> "BTC/USD @ 101.85" -> Buy Limit -> PG order
+28040 limit new price=101.85 exact. Test orders cleaned up after.

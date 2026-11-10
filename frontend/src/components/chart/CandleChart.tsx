@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { createChart, ColorType, TickMarkType, type IChartApi, type ISeriesApi, type LogicalRange, type Range, type Time, type UTCTimestamp } from "lightweight-charts";
 import { useChartStore } from "@/store/chartStore";
 import { useOrderbookStore } from "@/store/orderbookStore";
 import { ChartToolbar } from "./ChartToolbar";
 import { DepthOverlay, PANE_DIVIDER_FRAC } from "./DepthOverlay";
+import { ChartTradePad } from "./ChartTradePad";
+import { ChartContextMenu, type ChartMenuState } from "./ChartContextMenu";
+import { useAuthStore } from "@/store/authStore";
 
 const DEPTH_PREFS_KEY = "uvity.depthOverlay";
 
@@ -88,10 +91,40 @@ export function CandleChart() {
 
   const [hasData, setHasData] = useState(false);
 
+  // one-click trading widgets (right-click menu + pinned market pad)
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const [padQty, setPadQty] = useState(() => localStorage.getItem("uvity.chartQty") || "0.1");
+  const [chartMsg, setChartMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [menu, setMenu] = useState<ChartMenuState | null>(null);
+
+  const setPadQtyPersisted = (v: string) => {
+    setPadQty(v);
+    localStorage.setItem("uvity.chartQty", v);
+  };
+
+  useEffect(() => {
+    if (!chartMsg) return;
+    const t = setTimeout(() => setChartMsg(null), 5000);
+    return () => clearTimeout(t);
+  }, [chartMsg]);
+
   // depth histogram overlay state
   const [chartApi, setChartApi] = useState<IChartApi | null>(null);
   const [seriesApi, setSeriesApi] = useState<ISeriesApi<"Candlestick"> | null>(null);
   const [depthPrefs, setDepthPrefs] = useState<DepthPrefs>(loadDepthPrefs);
+
+  const openMenuAtCursor = (e: ReactMouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (!isAuthenticated || !containerRef.current || !seriesRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const price = seriesRef.current.coordinateToPrice(e.clientY - rect.top);
+    if (price == null) return;
+    setMenu({
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      price: Number(price).toFixed(2),
+    });
+  };
 
   const toggleDepth = (key: keyof DepthPrefs) => {
     setDepthPrefs((prev) => {
@@ -337,7 +370,12 @@ export function CandleChart() {
         timeframe={timeframe}
         onTimeframeChange={setTimeframe}
       />
-      <div ref={containerRef} className="relative flex-1 min-h-0">
+      <div
+        ref={containerRef}
+        className="relative flex-1 min-h-0"
+        onContextMenu={openMenuAtCursor}
+        onClick={() => setMenu(null)}
+      >
         {loading && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-gray-500">
             Loading candles...
@@ -368,6 +406,34 @@ export function CandleChart() {
           className="pointer-events-none absolute left-2 top-10 z-20 rounded border border-border bg-panelLight/85 px-2 py-1 font-mono text-[11px] backdrop-blur-sm"
           style={{ display: "none" }}
         />
+        {isAuthenticated && (
+          <ChartTradePad
+            symbol={symbol}
+            qty={padQty}
+            setQty={setPadQtyPersisted}
+            msg={chartMsg}
+            setMsg={setChartMsg}
+          />
+        )}
+        {menu && (
+          <>
+            <div
+              className="absolute inset-0 z-30"
+              onClick={() => setMenu(null)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu(null);
+              }}
+            />
+            <ChartContextMenu
+              symbol={symbol}
+              qty={padQty}
+              menu={menu}
+              onDone={setChartMsg}
+              onClose={() => setMenu(null)}
+            />
+          </>
+        )}
         {/* depth overlay legend / toggles */}
         <div className="pointer-events-auto absolute left-2 top-2 z-20 flex items-center gap-1.5 rounded border border-border bg-panelLight/80 px-2 py-1 backdrop-blur-sm">
           <button
