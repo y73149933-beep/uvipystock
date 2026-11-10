@@ -43,6 +43,10 @@ services:
   # ─── Redis ─────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
+    # AOF: the book/stop queues/kline cache are runtime state we can
+    # rebuild, but every lost write is a window of inconsistent order
+    # state between PostgreSQL and the matching engine.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     container_name: exchange-redis
     ports:
       - "6379:6379"

@@ -82,6 +82,24 @@ class OrderRepository(BaseRepository[Order]):
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
+    async def list_resting_open(self) -> Sequence[Order]:
+        """Active orders that must be present in the price-time book.
+
+        Used by the matching worker at startup to rebuild the Redis book
+        from PostgreSQL when the runtime index was lost (flush/purge/
+        stale RDB). Only book-resident types: market/IOC/FOK never rest,
+        stop types live in the stop queues (StopMonitorService).
+        """
+        active = [OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED]
+        resting_types = [OrderType.LIMIT, OrderType.POST_ONLY, OrderType.ICEBERG]
+        stmt = (
+            select(Order)
+            .where(Order.status.in_(active), Order.type.in_(resting_types))
+            .order_by(Order.created_at.asc())
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
+
     async def list_pending_stops_by_symbol(self, symbol: str) -> Sequence[Order]:
         """All stop-type orders awaiting trigger (status=PENDING)."""
         stop_types = [OrderType.STOP_MARKET, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP]

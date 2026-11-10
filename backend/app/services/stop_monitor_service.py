@@ -158,6 +158,12 @@ class StopMonitorService:
                         # Rescan pending stops for this new symbol
                         await self._rescan_pending_stops([pair.symbol])
 
+                # The stop queues are a runtime index over PG: a Redis
+                # purge/restart at RUNTIME (no backend restart) otherwise
+                # leaves live PENDING stops unarmed forever until the next
+                # deployment. Cheap reconciliation on every tick.
+                await self._rescan_pending_stops([p.symbol for p in pairs])
+
             except asyncio.CancelledError:
                 break
             except Exception as e:

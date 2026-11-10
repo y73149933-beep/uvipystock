@@ -279,3 +279,27 @@ leaves the plot; hidden when there is no data. Updates are imperative
 DOM writes (no React re-render per mousemove). Verified headless:
 hover over a real bar reads "15:48 O 99 H 101 L 98.3 C 99 Vol 1.229",
 over idle bars "Vol 0", off-chart shows the last bar.
+
+## Book self-healing after Redis loss + Redis AOF
+
+PG is truth, the Redis book/open-index is a runtime index; stops got a
+rescan earlier, resting limit orders had none - after a Redis purge they
+sat in PG forever unmatched. MatchingWorker now re-registers every PG-open
+limit/post_only/iceberg order missing from the book: at startup AND every
+30s idle tick (BRPOP timeout), each under FOR UPDATE immediately before
+ZADD (writes inside the row lock, so a concurrent cancel either blocks or
+removes the fresh entry - cancelled orders can never be resurrected).
+StopMonitorService rescan likewise moved from startup-only to the 30s
+periodic refresh tick.
+
+Redis persistence: appendonly yes, appendfsync everysec (was RDB-only
+with up to 1h windows).
+
+E2E proof: placed limit x2 + iceberg + stop_limit; FLUSHALL at runtime,
+NO restarts -> within 45s worker re-registered 4 book orders and stop
+monitor re-armed the stop; a market order then filled against the
+rebooked maker (partially_filled 0.1 @91); an order cancelled while the
+book was empty stayed out (canceled, in_book=False); iceberg HASH
+quantity/visible/hidden intact; open index complete. Negative control:
+after cleanup (0 open orders) a flushall correctly re-registers nothing.
+Regressions: takers 100/100, P5 19/19, cleanup 26/26.

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -152,6 +153,7 @@ class MatchingWorker:
     def __init__(self, block_timeout: int = 1) -> None:
         self.engine = CMatchingEngine()
         self._running = False
+        self._rebook_interval = 30.0  # seconds between idle book reconciliations
         # Short BRPOP timeout (1s) so the loop can detect connection drops
         # quickly and reconnect. The tradeoff is slightly more CPU on empty
         # polls, but 1s is negligible.
@@ -179,13 +181,24 @@ class MatchingWorker:
         # Wait for Redis to be reachable
         await self._wait_for_redis()
 
+        # PostgreSQL is truth, the book ZSETs/HASHes are a runtime index:
+        # a Redis flush/purge or a restart onto a stale snapshot would
+        # otherwise leave live limit orders unmatched forever.
+        await self._rebook_resting_orders()
+        last_rebook = time.monotonic()
+
         while self._running:
             try:
                 raw_bytes = await self._brpop_redis.brpop(
                     queues.ORDERS_QUEUE, timeout=self._block_timeout,
                 )
                 if raw_bytes is None:
-                    # BRPOP timeout — no items, just loop
+                    # BRPOP timeout — no items. Reconcile the book against
+                    # PG periodically so a RUNTIME Redis loss (no restart)
+                    # heals on its own; idle ticks only, never mid-action.
+                    if time.monotonic() - last_rebook >= self._rebook_interval:
+                        last_rebook = time.monotonic()
+                        await self._rebook_resting_orders()
                     continue
 
                 # Parse the payload
@@ -214,6 +227,88 @@ class MatchingWorker:
                 except Exception:
                     pass
                 await asyncio.sleep(1.0)
+
+    async def _rebook_resting_orders(self) -> None:
+        """Re-register PG-open resting orders that are missing from the Redis book.
+
+        Mirror of StopMonitorService._rescan_pending_stops for the
+        price-time book. Every order is re-checked under FOR UPDATE
+        immediately before it is re-added, and the Redis write happens
+        while that row lock is held: the API cancel path locks the same
+        row, so an order cancelled while the book was empty can never be
+        resurrected (whoever runs second sees the closed row / removes
+        the fresh entry). This worker is the only book writer and this
+        runs before the BRPOP loop, so no settlement can race it.
+        Resting quantity is re-derived from quantity - filled_quantity;
+        price-time priority within a level restarts with fresh seqs.
+        """
+        redis = self._redis
+        try:
+            async with async_session_factory() as session:
+                candidates = await OrderRepository(session).list_resting_open()
+        except Exception:
+            logger.exception("[book] rebook: failed to load open orders from PG")
+            return
+
+        rebooked = 0
+        for cand in candidates:
+            try:
+                if await redis.zscore(orderbook.side_key(cand.symbol, cand.side), str(cand.id)) is not None:
+                    continue
+                async with async_session_factory() as session:
+                    async with session.begin():
+                        order = await OrderRepository(session).get_for_update(cand.id)
+                        if order is None or order.status not in (
+                            OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED,
+                        ):
+                            continue
+                        remaining = order.quantity - order.filled_quantity
+                        if remaining <= 0:
+                            continue
+                        is_iceberg = order.type == OrderType.ICEBERG
+                        visible = (
+                            min(order.visible_quantity, remaining)
+                            if is_iceberg and order.visible_quantity else remaining
+                        )
+                        side_val = order.side.value if hasattr(order.side, "value") else order.side
+                        type_val = order.type.value if hasattr(order.type, "value") else order.type
+                        metadata = {
+                            "order_id": str(order.id),
+                            "user_id": str(order.user_id),
+                            "symbol": order.symbol,
+                            "side": side_val,
+                            "type": type_val,
+                            "price": str(order.price) if order.price else "",
+                            "quantity": str(remaining),
+                            "visible_quantity": str(visible),
+                            "hidden_quantity": str(remaining - visible) if is_iceberg else "",
+                            "is_iceberg": "1" if is_iceberg else "0",
+                        }
+                        # Redis write INSIDE the row lock: a concurrent cancel
+                        # blocks on FOR UPDATE, runs after us, and zrem's the
+                        # entry we just made. Correct final state either way.
+                        await orderbook.add_resting_order(
+                            redis,
+                            order_id=order.id,
+                            symbol=order.symbol,
+                            side=order.side,
+                            price=order.price or Decimal("0"),
+                            quantity=remaining,
+                            metadata=metadata,
+                        )
+                        await orders_index.add_open_order(
+                            redis, order.user_id, order.symbol, order.id,
+                        )
+                        rebooked += 1
+                        logger.warning(
+                            "[book] re-registered resting order %d (%s %s %s @ %s, remaining %s)",
+                            order.id, type_val, side_val, order.symbol, order.price, remaining,
+                        )
+            except Exception:
+                logger.exception("[book] rebook failed for order %s", cand.id)
+        if rebooked:
+            logger.warning("[book] rebook done: %d order(s) re-registered, %d candidates checked",
+                           rebooked, len(candidates))
 
     async def _init_brpop_connection(self) -> None:
         """Create a dedicated Redis connection for BRPOP.
