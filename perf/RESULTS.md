@@ -153,3 +153,24 @@ Verification (perf38): P5 19/19 including
 - "STP: own-only liquidity → expired, no trades, funds released";
 engine unit tests 33/33 (6 new STP tests); 0 same-user trades across the
 whole run in DB; P3 regression 100/100 fills unchanged.
+
+## Consistency audit: no zombie orders (2026-11-10)
+
+Full-order integrity audit (open orders vs Redis structures vs balances):
+
+- every open order is registered in the correct runtime structure (book /
+  stops / trailing); no market orders stuck open;
+- no ghost ZSET entries (book/stops members that are terminal or missing
+  in PG); no entries missing their order HASH;
+- locked_balance == sum(locked_amount of open orders) for every user/asset;
+- queue:orders depth 0, dead-letter 0.
+
+The audit found and fixed a real gap: PG holds PENDING stops as source of
+truth, but the Redis stop queues are only the runtime index — after a
+Redis purge a live stop became a zombie the monitor would never trigger.
+Startup `_rescan_pending_stops` now re-registers any PENDING stop missing
+from the queues (trailing stops without a stored trigger are skipped as
+un-reconstructable rather than armed at price 0). The benchmark harness
+now also cancels `pending` orders in its clean-slate pass, so test purges
+cannot manufacture stranded stops. Post-fix: 19/19 zombies re-armed on
+startup, then canceled cleanly through the API; final audit all-zero.

@@ -518,14 +518,18 @@ class StopMonitorService:
                 )
 
     async def _rescan_pending_stops(self, symbols: list[str]) -> None:
-        """On startup, re-evaluate all pending stops against last trade price.
+        """On startup, reconcile PG PENDING stops against the Redis queues.
 
-        This catches any stops that should have triggered while the monitor
-        was offline.
+        PG is the source of truth; ``stops:{symbol}``/``trailing:{symbol}``
+        are the runtime index the trigger scan reads. Anything a live
+        PENDING stop lost there (Redis purge/restart, a failed deferred
+        registration) is silently re-registered, so a user's stop can never
+        become a zombie that the monitor will never see again. Then every
+        pending stop is re-evaluated against the last trade price to catch
+        triggers that fired while the monitor was offline.
         """
         async with async_session_factory() as session:
             repo = OrderRepository(session)
-            trade_repo = OrderRepository(session)  # reuse for trade queries
             from app.repositories.trade_repo import TradeRepository
             trade_repo_proper = TradeRepository(session)
 
@@ -541,7 +545,56 @@ class StopMonitorService:
 
                 # Load pending stops from PG
                 pending = await repo.list_pending_stops_by_symbol(symbol)
+                redis = get_redis()
                 for order in pending:
+                    # ── Re-register the runtime index if it is missing ──
+                    try:
+                        is_trailing = order.type == OrderType.TRAILING_STOP
+                        key = stops.trailing_key(symbol) if is_trailing \
+                            else stops.stops_key(symbol)
+                        if await redis.zscore(key, str(order.id)) is None:
+                            if is_trailing and not order.stop_price:
+                                logger.warning(
+                                    "[stops] trailing stop %d has no stored "
+                                    "trigger — cannot safely re-register", order.id,
+                                )
+                            elif is_trailing:
+                                await stops.register_trailing_stop(
+                                    redis, order_id=order.id, symbol=symbol,
+                                    side=order.side, delta_type="abs",
+                                    delta_value=order.trailing_delta or Decimal("0"),
+                                    initial_extreme=order.stop_price or Decimal("0"),
+                                    initial_trigger=order.stop_price or Decimal("0"),
+                                )
+                            else:
+                                await stops.add_stop_order(
+                                    redis, order_id=order.id, symbol=symbol,
+                                    stop_price=order.stop_price or Decimal("0"),
+                                )
+                            logger.info(
+                                "[stops] re-registered orphaned PENDING stop %d "
+                                "(%s %s) into Redis", order.id, order.type.value, symbol,
+                            )
+                        from app.redis_client import orders_index
+                        await orders_index.add_open_order(
+                            redis, order.user_id, symbol, order.id,
+                        )
+                        metadata = {
+                            "order_id": str(order.id),
+                            "user_id": str(order.user_id),
+                            "symbol": symbol,
+                            "side": order.side.value,
+                            "type": order.type.value,
+                            "stop_price": str(order.stop_price) if order.stop_price else "",
+                            "quantity": str(order.quantity),
+                            "is_iceberg": "0",
+                        }
+                        await orderbook.store_order_hash(redis, order.id, metadata)
+                    except Exception:
+                        logger.exception(
+                            "Failed to re-register pending stop %d", order.id,
+                        )
+
                     should_trigger = False
                     if order.side == OrderSide.SELL:
                         # Sell-stop: trigger if last_price <= stop_price
