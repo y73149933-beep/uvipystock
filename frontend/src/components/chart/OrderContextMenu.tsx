@@ -2,26 +2,30 @@ import { useState } from "react";
 import { useOrdersStore } from "@/store/ordersStore";
 import { ordersApi } from "@/api/orders";
 import { formatQty, normalizeDecimal } from "@/lib/format";
-import type { MyLevel } from "./chartOrderDrag";
+import { applyStopReplace } from "./chartOrderDrag";
+import type { MyLevel, MyStopLevel } from "./chartOrderDrag";
 import type { Order } from "@/types/order";
 
 interface OrderContextMenuProps {
-  level: MyLevel;
+  level: MyLevel | MyStopLevel;
+  stopType?: "stop_market" | "stop_limit";
   x: number;
   y: number;
   onClose: () => void;
   onDone: (m: { text: string; ok: boolean }) => void;
 }
 
-/** Click (no drag) on one of my violet bars: manage the order(s) at that
- *  price level without leaving the chart. */
-export function OrderContextMenu({ level, x, y, onClose, onDone }: OrderContextMenuProps) {
+/** Click (no drag) on one of my violet bars or amber stop lines: manage the
+ *  order(s) at that price level without leaving the chart. */
+export function OrderContextMenu({ level, stopType, x, y, onClose, onDone }: OrderContextMenuProps) {
   const openOrders = useOrdersStore((s) => s.openOrders);
   const setFocusOrder = useOrdersStore((s) => s.setFocusOrder);
+  const first = () => openOrders.find((o) => o.id === level.orderIds[0]);
   const [qty, setQty] = useState(() =>
-    level.orderIds.length === 1
-      ? normalizeDecimal(openOrders.find((o) => o.id === level.orderIds[0])?.remaining_quantity ?? "")
-      : "",
+    level.orderIds.length === 1 ? normalizeDecimal(first()?.remaining_quantity ?? "") : "",
+  );
+  const [stop, setStop] = useState(() =>
+    stopType ? normalizeDecimal(first()?.stop_price ?? "") : "",
   );
 
   const live = level.orderIds
@@ -61,10 +65,28 @@ export function OrderContextMenu({ level, x, y, onClose, onDone }: OrderContextM
       return;
     }
     const o = live[0];
+    if (stopType) {
+      // backend modify is limit-only: stops move by cancel + re-create
+      const sp = parseFloat(stop);
+      const useStop = Number.isFinite(sp) && sp > 0 ? stop : (o.stop_price as string);
+      void act(async () => (await applyStopReplace(o, useStop, String(q))).text);
+      return;
+    }
     void act(async () => {
       const n = await ordersApi.modify(o.id, { price: o.price as string, quantity: String(q) });
       return `#${o.id} qty -> #${n.id} ${n.quantity} @ ${n.price}`;
     });
+  };
+
+  const applyStop = () => {
+    const sp = parseFloat(stop);
+    if (!Number.isFinite(sp) || sp <= 0) {
+      onDone({ ok: false, text: "bad stop price" });
+      return;
+    }
+    const q = parseFloat(qty);
+    const useQty = Number.isFinite(q) && q > 0 ? String(q) : live[0].remaining_quantity;
+    void act(async () => (await applyStopReplace(live[0], stop, useQty)).text);
   };
 
   return (
@@ -76,7 +98,8 @@ export function OrderContextMenu({ level, x, y, onClose, onDone }: OrderContextM
       onClick={(e) => e.stopPropagation()}
     >
       <div className="border-b border-border px-2 py-1 text-[10px] uppercase tracking-wider text-gray-500">
-        {live[0].symbol} · {level.price} · {live.length === 1 ? `#${live[0].id}` : `${live.length} orders`}
+        {live[0].symbol} · {stopType ? `stop ${level.price}` : level.price} ·{" "}
+        {live.length === 1 ? `#${live[0].id}` : `${live.length} orders`}
       </div>
       {live.map((o) => (
         <button
@@ -101,21 +124,47 @@ export function OrderContextMenu({ level, x, y, onClose, onDone }: OrderContextM
       )}
       {live.length === 1 && (
         <div className="flex items-center gap-1 border-t border-border/50 px-2 py-1.5">
+          {stopType && (
+            <input
+              value={stop}
+              onChange={(e) => setStop(e.target.value)}
+              inputMode="decimal"
+              title="New stop trigger price (cancel-replace)"
+              className="w-[4.5rem] rounded border border-border bg-panel px-1.5 py-1 text-right font-mono text-[11px] text-gray-100 outline-none focus:border-accent"
+            />
+          )}
           <input
             value={qty}
             onChange={(e) => setQty(e.target.value)}
             step="0.0001"
             inputMode="decimal"
             title="New quantity (cancel-replace)"
-            className="w-20 rounded border border-border bg-panel px-1.5 py-1 text-right font-mono text-[11px] text-gray-100 outline-none focus:border-accent"
+            className="w-16 rounded border border-border bg-panel px-1.5 py-1 text-right font-mono text-[11px] text-gray-100 outline-none focus:border-accent"
           />
-          <button
-            onClick={applyQty}
-            className="rounded bg-accent px-2 py-1 text-[10px] font-bold text-black"
-          >
-            Set qty
-          </button>
+          {stopType ? (
+            <button
+              onClick={applyStop}
+              className="rounded bg-accent px-2 py-1 text-[10px] font-bold text-black"
+            >
+              Move
+            </button>
+          ) : (
+            <button
+              onClick={applyQty}
+              className="rounded bg-accent px-2 py-1 text-[10px] font-bold text-black"
+            >
+              Set qty
+            </button>
+          )}
         </div>
+      )}
+      {live.length === 1 && stopType && (
+        <button
+          onClick={applyQty}
+          className="block w-full border-t border-border/50 px-2 py-1.5 text-left text-[11px] text-gray-300 hover:bg-panel"
+        >
+          Set qty (keeps trigger)
+        </button>
       )}
       <button
         onClick={() => {

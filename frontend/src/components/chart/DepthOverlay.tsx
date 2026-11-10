@@ -317,7 +317,7 @@ export function DepthOverlay({
         const y = toY(drag.newPrice);
         if (y !== null && y > 2 && y < paneH - 2) {
           ctx.save();
-          ctx.strokeStyle = MINE_COLOR(0.9);
+          ctx.strokeStyle = drag.isStop ? STOP_COLOR : MINE_COLOR(0.9);
           ctx.lineWidth = 1.5;
           ctx.setLineDash([5, 4]);
           ctx.beginPath();
@@ -339,7 +339,7 @@ export function DepthOverlay({
           ctx.font = "600 10px 'JetBrains Mono', monospace";
           ctx.textBaseline = "alphabetic";
           ctx.fillStyle = MINE_TEXT_COLOR;
-          ctx.fillText(`\u2192 ${drag.newPrice.toFixed(2)}`, 8, y > (yOld ?? 0) ? y - 6 : y + 14);
+          ctx.fillText(`\u2192 ${drag.isStop ? "stop " : ""}${drag.newPrice.toFixed(2)}`, 8, y > (yOld ?? 0) ? y - 6 : y + 14);
           ctx.restore();
         }
       }

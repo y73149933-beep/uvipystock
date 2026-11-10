@@ -7,9 +7,9 @@ import { DepthOverlay, PANE_DIVIDER_FRAC } from "./DepthOverlay";
 import { ChartTradePad } from "./ChartTradePad";
 import { ChartContextMenu, type ChartMenuState } from "./ChartContextMenu";
 import { useAuthStore } from "@/store/authStore";
-import { buildMyLevels, dragState, applyDragModify } from "./chartOrderDrag";
+import { buildMyLevels, buildMyStops, dragState, applyDragModify, applyStopReplace } from "./chartOrderDrag";
 import { OrderContextMenu } from "./OrderContextMenu";
-import type { MyLevel } from "./chartOrderDrag";
+import type { MyLevel, MyStopLevel } from "./chartOrderDrag";
 import { useOrdersStore } from "@/store/ordersStore";
 
 const DEPTH_PREFS_KEY = "uvity.depthOverlay";
@@ -102,7 +102,8 @@ export function CandleChart() {
   const [padQty, setPadQty] = useState(() => localStorage.getItem("uvity.chartQty") || "0.1");
   const [chartMsg, setChartMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [menu, setMenu] = useState<ChartMenuState | null>(null);
-  const [orderMenu, setOrderMenu] = useState<{ level: MyLevel; x: number; y: number } | null>(null);
+  type OrderMenuState = { level: MyLevel | MyStopLevel; stopType?: "stop_market" | "stop_limit"; x: number; y: number };
+  const [orderMenu, setOrderMenu] = useState<OrderMenuState | null>(null);
   const menuOpenedAtRef = useRef(0);
 
   useEffect(() => {
@@ -171,8 +172,19 @@ export function CandleChart() {
         break;
       }
     }
-    if (!level) return;
-    const hitLevel = level; // stable narrowing inside the async closures
+    // then the amber stop trigger lines (grabbable only when visible)
+    let stopLevel = null as MyStopLevel | null;
+    if (!level && depthPrefs.stops) {
+      for (const l of buildMyStops(orders, symbol)) {
+        const ly = series.priceToCoordinate(l.price);
+        if (ly !== null && Math.abs((ly as number) - y) <= 5) {
+          stopLevel = l;
+          break;
+        }
+      }
+    }
+    if (!level && !stopLevel) return;
+    const hitLevel = level ?? stopLevel!; // stable narrowing inside the async closures
     // newest order at the level gets replaced (the UI shows #id for singles)
     const orderId = hitLevel.orderIds[hitLevel.orderIds.length - 1];
     const ord = orders.find((o) => o.id === orderId);
@@ -198,9 +210,10 @@ export function CandleChart() {
       dragState.current = {
         symbol,
         orderId,
-        side: level!.side,
-        oldPrice: level!.price,
+        side: hitLevel.side,
+        oldPrice: hitLevel.price,
         newPrice: Number(Number(p).toFixed(2)),
+        isStop: !level,
       };
     };
     const onUp = async () => {
@@ -213,6 +226,7 @@ export function CandleChart() {
         const cr = cont.getBoundingClientRect();
         setOrderMenu({
           level: hitLevel,
+          stopType: stopLevel ? stopLevel.stopType : undefined,
           x: Math.max(2, Math.min(startX, cr.width - 292)),
           y: Math.max(2, Math.min(startY, cr.height - 190)),
         });
@@ -222,7 +236,9 @@ export function CandleChart() {
       const d = dragState.current;
       dragState.current = null;
       if (!d || d.newPrice === d.oldPrice) return;
-      const r = await applyDragModify(orderId, d.newPrice.toFixed(2), ord.remaining_quantity);
+      const r = d.isStop
+        ? await applyStopReplace(ord, d.newPrice.toFixed(2), ord.remaining_quantity)
+        : await applyDragModify(orderId, d.newPrice.toFixed(2), ord.remaining_quantity);
       setChartMsg(r);
       void useOrdersStore.getState().fetchOpenOrders();
     };
@@ -551,6 +567,7 @@ export function CandleChart() {
         {orderMenu && (
           <OrderContextMenu
             level={orderMenu.level}
+            stopType={orderMenu.stopType}
             x={orderMenu.x}
             y={orderMenu.y}
             onClose={() => setOrderMenu(null)}
