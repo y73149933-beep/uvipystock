@@ -27,6 +27,9 @@ export function OrderContextMenu({ level, stopType, x, y, onClose, onDone }: Ord
   const [stop, setStop] = useState(() =>
     stopType ? normalizeDecimal(first()?.stop_price ?? "") : "",
   );
+  const [limit, setLimit] = useState(() =>
+    stopType === "stop_limit" ? normalizeDecimal(first()?.price ?? "") : "",
+  );
 
   const live = level.orderIds
     .map((id) => openOrders.find((o) => o.id === id))
@@ -86,7 +89,14 @@ export function OrderContextMenu({ level, stopType, x, y, onClose, onDone }: Ord
     }
     const q = parseFloat(qty);
     const useQty = Number.isFinite(q) && q > 0 ? String(q) : live[0].remaining_quantity;
-    void act(async () => (await applyStopReplace(live[0], stop, useQty)).text);
+    const lim = parseFloat(limit);
+    if (stopType === "stop_limit" && (!Number.isFinite(lim) || lim <= 0)) {
+      onDone({ ok: false, text: "bad limit price" });
+      return;
+    }
+    void act(async () =>
+      (await applyStopReplace(live[0], stop, useQty, stopType === "stop_limit" ? limit : undefined)).text,
+    );
   };
 
   return (
@@ -124,6 +134,15 @@ export function OrderContextMenu({ level, stopType, x, y, onClose, onDone }: Ord
       )}
       {live.length === 1 && (
         <div className="flex items-center gap-1 border-t border-border/50 px-2 py-1.5">
+          {stopType === "stop_limit" && (
+            <input
+              value={limit}
+              onChange={(e) => setLimit(e.target.value)}
+              inputMode="decimal"
+              title="New limit price when triggered"
+              className="w-[4.5rem] rounded border border-border bg-panel px-1.5 py-1 text-right font-mono text-[11px] text-gray-100 outline-none focus:border-accent"
+            />
+          )}
           {stopType && (
             <input
               value={stop}

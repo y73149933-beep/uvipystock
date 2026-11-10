@@ -114,18 +114,31 @@ export async function applyStopReplace(
   o: Order,
   newStopPrice: string,
   quantity: string,
+  newLimit?: string,
 ): Promise<{ ok: boolean; text: string }> {
+  const body: OrderCreateRequest = {
+    symbol: o.symbol,
+    side: o.side,
+    type: o.type,
+    stop_price: newStopPrice,
+    quantity,
+  };
+  if (o.type === "stop_limit") body.price = newLimit || o.price || undefined;
   try {
-    await ordersApi.cancel(o.id);
-    const body: OrderCreateRequest = {
-      symbol: o.symbol,
-      side: o.side,
-      type: o.type,
-      stop_price: newStopPrice,
-      quantity,
-    };
-    if (o.type === "stop_limit" && o.price) body.price = o.price;
+    // create FIRST: a failed create must never leave the user with nothing.
     const n = await ordersApi.create(body);
+    try {
+      await ordersApi.cancel(o.id);
+    } catch {
+      // could not retire the old one: roll the new one back so we do not
+      // double-trigger, and report honestly
+      try {
+        await ordersApi.cancel(n.id);
+      } catch {
+        // best effort
+      }
+      return { ok: false, text: `stop replace #${o.id} failed (old kept)` };
+    }
     return { ok: true, text: `#${o.id} stop -> #${n.id} @ ${newStopPrice} (${n.status})` };
   } catch (err) {
     const e = err as { message?: string };
