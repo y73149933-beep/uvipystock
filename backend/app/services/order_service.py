@@ -306,6 +306,43 @@ class OrderService:
         buffer = total_cost * Decimal("1.001")
         return (pair.quote_asset, buffer)
 
+    async def _require_market_sell_liquidity(
+        self,
+        dto: "OrderCreateDTO",
+        pair: TradingPair,
+        user_id: int,
+    ) -> None:
+        """Symmetric counterpart of the MARKET BUY book walk: a MARKET SELL
+        against an empty/thin bid side would otherwise settle as 'expired'
+        moments after appearing as 'new' in the UI. Reject upfront instead.
+
+        Self-trade prevention mirror: the taker's OWN bids are excluded —
+        the matcher will never fill against them.
+        """
+        redis = get_redis()
+        bid_orders = await orderbook.get_opposite_orders_for_match(
+            redis, dto.symbol, "sell", limit=1000,
+        )
+        if not bid_orders:
+            raise OrderValidationError(
+                f"Cannot place MARKET SELL on {dto.symbol}: no bids available"
+            )
+
+        remaining_qty = dto.quantity
+        for bid in bid_orders:
+            if remaining_qty <= 0:
+                break
+            if user_id and bid.get("user_id") == user_id:
+                continue  # self-trade prevention: matcher skips these
+            bid_qty = Decimal(str(bid["visible_quantity"] if bid.get("is_iceberg") else bid["quantity"]))
+            remaining_qty -= bid_qty
+
+        if remaining_qty > 0:
+            raise OrderValidationError(
+                f"Cannot place MARKET SELL {dto.quantity} {pair.base_asset} on {dto.symbol}: "
+                f"insufficient bid volume in the order book"
+            )
+
     # ─── PLACE ──────────────────────────────────────────────────────────────
 
     async def place_order(
@@ -336,6 +373,9 @@ class OrderService:
             lock_asset, lock_amount = ("", Decimal("0"))
         elif dto.type == "market" and dto.side == "buy":
             lock_asset, lock_amount = await self._compute_market_buy_lock(dto, pair, user_id)
+        elif dto.type == "market" and dto.side == "sell":
+            await self._require_market_sell_liquidity(dto, pair, user_id)
+            lock_asset, lock_amount = self._compute_lock_asset_and_amount(dto, pair)
         else:
             lock_asset, lock_amount = self._compute_lock_asset_and_amount(dto, pair)
 
@@ -948,6 +988,9 @@ class OrderService:
                 lock_asset, lock_amount = ("", Decimal("0"))
             elif dto.type == "market" and dto.side == "buy":
                 lock_asset, lock_amount = await self._compute_market_buy_lock(dto, pair, user_id)
+            elif dto.type == "market" and dto.side == "sell":
+                await self._require_market_sell_liquidity(dto, pair, user_id)
+                lock_asset, lock_amount = self._compute_lock_asset_and_amount(dto, pair)
             else:
                 lock_asset, lock_amount = self._compute_lock_asset_and_amount(dto, pair)
 

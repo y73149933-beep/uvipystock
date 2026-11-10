@@ -416,3 +416,16 @@ E2E (selenium + seeded book bench2 sell2@105/buy2@90):
 pad Buy -> #28038 market filled @105; pad Sell -> #28039 filled @90;
 contextmenu at y-fraction .35 -> "BTC/USD @ 101.85" -> Buy Limit -> PG order
 28040 limit new price=101.85 exact. Test orders cleaned up after.
+
+## Symmetric market-order liquidity guard
+
+Only MARKET BUY was pre-validated against the book; a MARKET SELL against an
+empty bid side was accepted (201 new), flashed in Open Orders, then expired
+in the worker. Added `_require_market_sell_liquidity` in order_service:
+empty bids -> 400 "no bids available"; bid volume (STP-aware: OWN bids are
+excluded, mirroring the buy-side walk) < qty -> 400 "insufficient bid
+volume". Wired into single AND bulk placement paths.
+Tests: 4 new in test_critical_fixes (empty/thin/own-bids/liquid), 14/14 file.
+Live: empty book sell -> 400 no bids; after seeding 0.5@95 -> 28072 FILLED.
+NOTE: market orders always respond status 'new' synchronously — settlement
+is async worker; only rejection UX is at API time.

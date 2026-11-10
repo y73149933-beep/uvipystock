@@ -180,6 +180,99 @@ def _order_kwargs(**over):
 #  FIX #1 — directional stop triggers
 # ============================================================================
 
+
+class TestMarketSellLiquidity:
+    """MARKET SELL must be rejected upfront against an empty/thin bid side,
+    mirroring the MARKET BUY 'no asks available' guard (UI saw a 'new' flash
+    then 'expired' because only the buy side was validated)."""
+
+    async def _svc_dto(self, db, quantity="1"):
+        from app.services.order_service import OrderCreateDTO
+        return OrderCreateDTO(symbol="BTC/USDT", side="sell", type="market",
+                              quantity=Decimal(quantity))
+
+    async def test_empty_book_rejected(self, db, redis, monkeypatch):
+        from app.services.order_service import OrderService, OrderValidationError
+        monkeypatch.setattr("app.services.order_service.get_redis", lambda: redis)
+        await make_pair(db)
+        async with db() as s:
+            async with s.begin():
+                s.add(Balance(user_id=1, asset="BTC", total_balance=Decimal("5"),
+                              locked_balance=Decimal("0"), available_balance=Decimal("5")))
+        with pytest.raises(OrderValidationError, match="no bids available"):
+            async with db() as s:
+                async with s.begin():
+                    await OrderService(s).place_order(1, await self._svc_dto(db))
+
+    async def test_thin_book_rejected(self, db, redis, monkeypatch):
+        from app.services.order_service import OrderService, OrderValidationError
+        monkeypatch.setattr("app.services.order_service.get_redis", lambda: redis)
+        await make_pair(db)
+        await orderbook.store_order_hash(redis, 700, {
+            "order_id": "700", "user_id": "2", "symbol": "BTC/USDT",
+            "side": "buy", "type": "limit", "price": "90", "quantity": "0.1",
+            "is_iceberg": "0",
+        })
+        await orderbook.add_resting_order(
+            redis, order_id=700, symbol="BTC/USDT", side="buy",
+            price=Decimal("90"), quantity=Decimal("0.1"),
+        )
+        async with db() as s:
+            async with s.begin():
+                s.add(Balance(user_id=1, asset="BTC", total_balance=Decimal("5"),
+                              locked_balance=Decimal("0"), available_balance=Decimal("5")))
+        with pytest.raises(OrderValidationError, match="insufficient bid volume"):
+            async with db() as s:
+                async with s.begin():
+                    await OrderService(s).place_order(1, await self._svc_dto(db, "1"))
+
+    async def test_own_bids_do_not_count(self, db, redis, monkeypatch):
+        """STP mirror: resting bids of the SAME user cannot 'provide' liquidity."""
+        from app.services.order_service import OrderService, OrderValidationError
+        monkeypatch.setattr("app.services.order_service.get_redis", lambda: redis)
+        await make_pair(db)
+        await orderbook.store_order_hash(redis, 701, {
+            "order_id": "701", "user_id": "1", "symbol": "BTC/USDT",
+            "side": "buy", "type": "limit", "price": "90", "quantity": "5",
+            "is_iceberg": "0",
+        })
+        await orderbook.add_resting_order(
+            redis, order_id=701, symbol="BTC/USDT", side="buy",
+            price=Decimal("90"), quantity=Decimal("5"),
+        )
+        async with db() as s:
+            async with s.begin():
+                s.add(Balance(user_id=1, asset="BTC", total_balance=Decimal("5"),
+                              locked_balance=Decimal("0"), available_balance=Decimal("5")))
+        with pytest.raises(OrderValidationError, match="insufficient bid volume"):
+            async with db() as s:
+                async with s.begin():
+                    await OrderService(s).place_order(1, await self._svc_dto(db, "1"))
+
+    async def test_liquid_book_accepted(self, db, redis, monkeypatch):
+        from app.services.order_service import OrderService
+        monkeypatch.setattr("app.services.order_service.get_redis", lambda: redis)
+        await make_pair(db)
+        await orderbook.store_order_hash(redis, 702, {
+            "order_id": "702", "user_id": "2", "symbol": "BTC/USDT",
+            "side": "buy", "type": "limit", "price": "90", "quantity": "5",
+            "is_iceberg": "0",
+        })
+        await orderbook.add_resting_order(
+            redis, order_id=702, symbol="BTC/USDT", side="buy",
+            price=Decimal("90"), quantity=Decimal("5"),
+        )
+        async with db() as s:
+            async with s.begin():
+                s.add(Balance(user_id=1, asset="BTC", total_balance=Decimal("5"),
+                              locked_balance=Decimal("0"), available_balance=Decimal("5")))
+        async with db() as s:
+            async with s.begin():
+                o = await OrderService(s).place_order(1, await self._svc_dto(db, "1"))
+        assert o.status == OrderStatus.NEW
+        assert o.type == OrderType.MARKET
+
+
 class TestStopsDirectional:
     async def _seed(self, redis, oid: int, side: str, stop_price: str) -> None:
         await stops.add_stop_order(redis, order_id=oid, symbol="BTC/USDT",
