@@ -9,6 +9,9 @@ interface OrdersState {
   loading: boolean;
   error: string | null;
   selectedIds: Set<number>;
+  /** chart widgets ask OpenOrdersTable to highlight & scroll to */
+  focusOrderId: number | null;
+  setFocusOrder: (id: number | null) => void;
   fetchOpenOrders: () => Promise<void>;
   applyOrderUpdate: (msg: OrderUpdateMsg) => void;
   toggleSelect: (id: number) => void;
@@ -24,6 +27,8 @@ export const useOrdersStore = create<OrdersState>((set, get) => ({
   loading: false,
   error: null,
   selectedIds: new Set(),
+  focusOrderId: null,
+  setFocusOrder: (id) => set({ focusOrderId: id }),
 
   fetchOpenOrders: async () => {
     set({ loading: true, error: null });

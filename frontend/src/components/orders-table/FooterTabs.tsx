@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useOrdersStore } from "@/store/ordersStore";
 import { OpenOrdersTable } from "./OpenOrdersTable";
 import { PositionsTable } from "./PositionsTable";
 import { MyTradesTable } from "./MyTradesTable";
@@ -8,6 +9,12 @@ type FooterTab = "orders" | "positions" | "trades";
 /** Footer pane switcher: open orders vs positions/PnL. */
 export function FooterTabs() {
   const [tab, setTab] = useState<FooterTab>("orders");
+  const focusOrderId = useOrdersStore((s) => s.focusOrderId);
+
+  // "Locate in Open Orders" from the chart jumps to the orders tab
+  useEffect(() => {
+    if (focusOrderId != null) setTab("orders");
+  }, [focusOrderId]);
 
   return (
     <div className="flex h-full flex-col">

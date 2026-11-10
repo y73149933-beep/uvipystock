@@ -8,6 +8,8 @@ import { ChartTradePad } from "./ChartTradePad";
 import { ChartContextMenu, type ChartMenuState } from "./ChartContextMenu";
 import { useAuthStore } from "@/store/authStore";
 import { buildMyLevels, dragState, applyDragModify } from "./chartOrderDrag";
+import { OrderContextMenu } from "./OrderContextMenu";
+import type { MyLevel } from "./chartOrderDrag";
 import { useOrdersStore } from "@/store/ordersStore";
 
 const DEPTH_PREFS_KEY = "uvity.depthOverlay";
@@ -100,6 +102,17 @@ export function CandleChart() {
   const [padQty, setPadQty] = useState(() => localStorage.getItem("uvity.chartQty") || "0.1");
   const [chartMsg, setChartMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [menu, setMenu] = useState<ChartMenuState | null>(null);
+  const [orderMenu, setOrderMenu] = useState<{ level: MyLevel; x: number; y: number } | null>(null);
+  const menuOpenedAtRef = useRef(0);
+
+  useEffect(() => {
+    if (!orderMenu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOrderMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [orderMenu]);
 
   const setPadQtyPersisted = (v: string) => {
     setPadQty(v);
@@ -159,8 +172,9 @@ export function CandleChart() {
       }
     }
     if (!level) return;
+    const hitLevel = level; // stable narrowing inside the async closures
     // newest order at the level gets replaced (the UI shows #id for singles)
-    const orderId = level.orderIds[level.orderIds.length - 1];
+    const orderId = hitLevel.orderIds[hitLevel.orderIds.length - 1];
     const ord = orders.find((o) => o.id === orderId);
     if (!ord) return;
     e.preventDefault();
@@ -192,7 +206,18 @@ export function CandleChart() {
     const onUp = async () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      if (!dragging) return; // plain click on my bar — no side effects yet
+      if (!dragging) {
+        // plain click (no drag) on my bar: manage the order from the chart
+        menuOpenedAtRef.current = Date.now();
+        // keep the menu inside the chart pane near right/bottom edges
+        const cr = cont.getBoundingClientRect();
+        setOrderMenu({
+          level: hitLevel,
+          x: Math.max(2, Math.min(startX, cr.width - 292)),
+          y: Math.max(2, Math.min(startY, cr.height - 190)),
+        });
+        return;
+      }
       setScroll(true);
       const d = dragState.current;
       dragState.current = null;
@@ -458,7 +483,11 @@ export function CandleChart() {
         className="relative flex-1 min-h-0"
         onContextMenu={openMenuAtCursor}
         onMouseDown={beginOrderDrag}
-        onClick={() => setMenu(null)}
+        onClick={() => {
+          if (Date.now() - menuOpenedAtRef.current < 250) return;
+          setMenu(null);
+          setOrderMenu(null);
+        }}
       >
         {loading && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-gray-500">
@@ -518,6 +547,15 @@ export function CandleChart() {
               onClose={() => setMenu(null)}
             />
           </>
+        )}
+        {orderMenu && (
+          <OrderContextMenu
+            level={orderMenu.level}
+            x={orderMenu.x}
+            y={orderMenu.y}
+            onClose={() => setOrderMenu(null)}
+            onDone={setChartMsg}
+          />
         )}
         {/* depth overlay legend / toggles */}
         <div className="pointer-events-auto absolute left-2 top-2 z-20 flex items-center gap-1.5 rounded border border-border bg-panelLight/80 px-2 py-1 backdrop-blur-sm">

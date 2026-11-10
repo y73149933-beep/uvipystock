@@ -13,6 +13,7 @@ export function OpenOrdersTable() {
   const orders = useOrdersStore((s) => s.openOrders);
   const loading = useOrdersStore((s) => s.loading);
   const selectedIds = useOrdersStore((s) => s.selectedIds);
+  const focusOrderId = useOrdersStore((s) => s.focusOrderId);
   const toggleSelect = useOrdersStore((s) => s.toggleSelect);
   const selectAll = useOrdersStore((s) => s.selectAll);
   const clearSelection = useOrdersStore((s) => s.clearSelection);
@@ -80,9 +81,17 @@ export function OpenOrdersTable() {
               {orders.map((order) => (
                 <tr
                   key={order.id}
+                  ref={
+                    order.id === focusOrderId
+                      ? (el) => {
+                          if (el) requestAnimationFrame(() => el.scrollIntoView({ block: "center", behavior: "smooth" }));
+                        }
+                      : undefined
+                  }
                   className={cn(
                     "border-t border-border/50 hover:bg-panel",
                     selectedIds.has(order.id) && "bg-accent/5",
+                    order.id === focusOrderId && "bg-violet-500/15 ring-1 ring-inset ring-violet-400/60",
                   )}
                 >
                   <td className="px-2 py-1">
