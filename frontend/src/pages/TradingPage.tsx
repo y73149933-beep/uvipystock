@@ -5,7 +5,8 @@ import { TradesFeed } from "@/components/orderbook/TradesFeed";
 import { StopBookPanel } from "@/components/orderbook/StopBookPanel";
 import { CandleChart } from "@/components/chart/CandleChart";
 import { TradeForm } from "@/components/trade-form/TradeForm";
-import { OpenOrdersTable } from "@/components/orders-table/OpenOrdersTable";
+import { FooterTabs } from "@/components/orders-table/FooterTabs";
+import { usePositionStore } from "@/store/positionStore";
 import { useOrderbookFeed } from "@/hooks/useOrderbook";
 import { usePrivateFeed } from "@/hooks/usePrivateFeed";
 import { useAuthStore } from "@/store/authStore";
@@ -58,6 +59,7 @@ export function TradingPage() {
   const fetchBalances = useBalanceStore((s) => s.fetchBalances);
   const fetchOpenOrders = useOrdersStore((s) => s.fetchOpenOrders);
   const fetchRecentTrades = useTradesStore((s) => s.fetchRecent);
+  const fetchPositions = usePositionStore((s) => s.fetchPositions);
   const fetchLadder = useStopLadderStore((s) => s.fetchLadder);
   const clearLadder = useStopLadderStore((s) => s.clear);
 
@@ -81,8 +83,9 @@ export function TradingPage() {
       fetchBalances();
       fetchOpenOrders();
       fetchRecentTrades(symbol);
+      fetchPositions();
     }
-  }, [isAuthenticated, fetchBalances, fetchOpenOrders, fetchRecentTrades, symbol]);
+  }, [isAuthenticated, fetchBalances, fetchOpenOrders, fetchRecentTrades, fetchPositions, symbol]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -96,7 +99,7 @@ export function TradingPage() {
       leftBottomPanel={<BottomPaneTabs />}
       center={<CandleChart />}
       rightPanel={<TradeForm />}
-      bottom={<OpenOrdersTable />}
+      bottom={<FooterTabs />}
     />
   );
 }

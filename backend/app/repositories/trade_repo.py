@@ -46,6 +46,16 @@ class TradeRepository(BaseRepository[Trade]):
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
+    async def list_all_user_trades(self, user_id: int) -> Sequence[Trade]:
+        """EVERY trade of the user, ascending by executed_at (position fold)."""
+        stmt = (
+            select(Trade)
+            .where((Trade.taker_user_id == user_id) | (Trade.maker_user_id == user_id))
+            .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
+
     async def list_recent_by_symbol(
         self,
         symbol: str,

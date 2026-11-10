@@ -3,6 +3,7 @@ import { PrivateSocket } from "@/ws/privateSocket";
 import { useAuthStore } from "@/store/authStore";
 import { useBalanceStore } from "@/store/balanceStore";
 import { useOrdersStore } from "@/store/ordersStore";
+import { schedulePositionsRefresh } from "@/store/positionStore";
 
 export type PrivateFeedStatus = "connecting" | "authenticating" | "connected" | "disconnected" | "error";
 
@@ -33,9 +34,14 @@ export function usePrivateFeed() {
       switch (msg.event) {
         case "balance":
           applyBalanceUpdate(msg);
+          schedulePositionsRefresh(1200);
           break;
         case "order":
           applyOrderUpdate(msg);
+          // fills change cost basis / realized PnL; debounced refetch
+          if (msg.status === "filled" || msg.status === "partially_filled") {
+            schedulePositionsRefresh();
+          }
           break;
         case "bulk_result":
           // Could show a toast notification here

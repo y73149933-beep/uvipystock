@@ -367,3 +367,24 @@ Fix: entries.sort((a,b) => b.ts - a.ts) before set/save in fetchRecent.
 Verified headless: place 3 market trades, login, tape top = newest
 (01:13:37 local); driver.refresh() -> tape top unchanged. localStorage
 round-trip head ts matches newest trade.
+
+## Positions & PnL panel
+
+New GET /api/v1/positions: per-symbol moving-average position folded from
+the user's full trade history (position_service.compute_positions, pure,
+7 unit tests — caught a real bug: cost basis must be reduced by the PRE-
+sell average, not the recomputed one). Position = trading delta, NOT
+account balance (testbed endowments aren't a position); last price from
+kline cache 1m latest close, fallback own last fill.
+
+Frontend: footer tabs Open Orders | Positions & PnL (FooterTabs),
+PositionsTable (size incl. locked marker, avg, last, value, uPnL/rPnL
+colored, totals row), positionStore + debounced refetch on private WS
+balance/order-fill events, 10s-poll not needed but fetch on auth mount.
+
+Verified e2e: controlled round-trip bench1 buy0.5@98 / sell0.5@99 vs
+bench2 market legs -> realized -4.5951 -> -3.7642 == +0.5*(99-97.3381),
+avg 97.0710 -> 97.3381, qty returns to 1.239; selenium tab dump matches
+to the cent. NOTE: order payload field is `type`, not `order_type` (422);
+market taker 400s when its maker leg has not landed in the book yet —
+space the two legs a moment apart.
