@@ -464,3 +464,34 @@ Drag e2e: Selenium W3C pointer down/move/up through window.__uvityChart
 (price<->pixel debug hook) moved 96->99.01: PG 28086 canceled, 28089 new @99.01.
 WARNING: t_sweep_all.py sweeps ALL users it can auth as via creds loop — it
 canceled test/test2 user ladders; run with eyes open.
+
+## Click-on-own-bar context menu (commit 95e5c71)
+- Plain click (no drag) on a violet own-order bar opens OrderContextMenu at cursor:
+  Cancel #id, Set qty (cancel-replace via modify API), Locate in Open Orders, Close.
+- Locate: ordersStore.focusOrderId -> FooterTabs auto-switches to Open Orders tab,
+  row gets violet ring + scrollIntoView(center).
+- Menu x/y clamped to pane (width-292 / height-190) near right/bottom edges.
+- E2E (ui_ordermenu2.py): menu #28121 -> Set qty 0.15 -> #28122; Locate ringed row
+  confirmed via DOM class; Cancel -> toast "#28122 canceled"; PG shows canceled.
+- Selenium pitfall found here: chart container geometry SHIFTS after login/re-render
+  (rectLeft 289->276, axis 62->66) - recompute bar_point before EVERY click, absolute
+  coords from session start go stale and hit the price-scale guard.
+
+## Menu input click fix (chart menus stopPropagation)
+Clicking the Set-qty / volume input inside OrderContextMenu or ChartContextMenu
+bubbled to the chart container onClick (click-away) and closed the menu
+(mousedown also hit beginOrderDrag and preventDefault-ed focus). Root divs of
+both menus now stopPropagation on mousedown+click. E2E: real W3C click on the
+input keeps menu open, typing works, Set qty replaces order; far chart click
+still closes.
+
+## Hardening: SPA cache headers (commit 1e97796)
+Preventive (no specific incident): nginx served the SPA with NO cache
+headers, so after repeated frontend rebuilds a browser could reuse a stale
+index.html referencing deleted hashed bundles -> black page on load. Now
+index.html is no-store and /assets immutable 1y (verified via curl -I).
+While there, verified positions flow: Positions tab renders clean, live
+open-position with the tab active = zero JS errors (bench1/bench2),
+test/test2 position folds are clean Decimals.
+Dockerfile echo pitfall: inside RUN echo '...' write \" as raw \" — backslash-escaped
+quotes land literally in nginx conf -> nginx -t fail -> crashloop.
