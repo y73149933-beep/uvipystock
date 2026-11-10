@@ -495,3 +495,40 @@ open-position with the tab active = zero JS errors (bench1/bench2),
 test/test2 position folds are clean Decimals.
 Dockerfile echo pitfall: inside RUN echo '...' write \" as raw \" — backslash-escaped
 quotes land literally in nginx conf -> nginx -t fail -> crashloop.
+
+## Decimal input prefill normalization
+Backend decimals arrive as raw DECIMAL(28,18) strings; cancel-replace
+round-trips made prefills grow zeros (0.1 -> 0.200000000000000000). Added
+normalizeDecimal() in lib/format.ts (string-level trailing-zero strip, no
+parseFloat precision loss) and applied to chart menu qty prefill AND the
+older EditOrderModal price/qty prefill. E2E: seed 0.1 -> menu shows 0.1;
+set 0.2 -> reopen shows 0.2; Edit modal shows 93 / 0.2.
+
+## Stop orders on the chart
+buildMyStops() aggregates own pending stop_market/stop_limit by side+trigger
+(single source for hit-test; overlay already draws the amber dashed lines).
+beginOrderDrag: resting violet bars take priority, then stop lines (only when
+the My-stops toggle is visible). Drag ghost goes amber with a 'stop' label.
+Backend modify_order is limit-only by design, so stops move via
+applyStopReplace = cancel + create through the normal placement path
+(validation, balance lock, Redis stop ZSET re-registration all reused; the
+gap is non-atomic but stops are not in the book). Click on the line opens
+OrderContextMenu in stop mode: header 'stop <price>', prefilled stop+qty
+(normalized decimals), Move / Set qty (keeps trigger) / Cancel / Locate.
+E2E: drag 90 -> 88.02, menu prefill 88.02/0.2, Move -> 91; PG chain
+canceled/canceled/pending, Redis ZSET holds only 28150@91000000.
+
+## Stop types audit (stop_market vs stop_limit)
+- Trigger semantics verified in stop_monitor_service: parent goes FILLED,
+  a CHILD order is created (stop_market -> MARKET no price; stop_limit ->
+  LIMIT at the placement limit). Child does NOT inherit stop_price, so the
+  chart model stays clean: triggered parent vanishes from stop levels, the
+  triggered stop_limit child appears as a normal violet draggable limit bar.
+- stop_limit was only half-supported by chart tools: replace preserved the
+  limit but nothing could edit it. Fixed: menu shows a third input ("New
+  limit price when triggered"); drag still moves only the trigger.
+- applyStopReplace re-ordered: create NEW first, then cancel old; if the
+  old cancel fails, roll back the new one. Old order-first sequence could
+  destroy the stop when create failed validation/balance.
+- E2E: stop_limit seed stop90/limit89 -> drag = 88.24/89 (limit kept) ->
+  menu Move = 91/85.5. PG chain canceled->canceled->pending correct.
