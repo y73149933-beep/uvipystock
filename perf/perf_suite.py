@@ -63,7 +63,9 @@ def api(method: str, path: str, body: str = "", auth: bool = True,
     except (BrokenPipeError, ConnectionResetError, OSError):
         conn.close()
         _tls.conn = None
-        return api(method, path, body, auth)
+        # NOTE: must forward creds on retry — falling back to the global
+        # CREDS silently re-attributed the request to another user.
+        return api(method, path, body, auth, creds)
 
 
 _tls = threading.local()
@@ -117,7 +119,7 @@ def phase0():
     for u in USERS:
         CREDS = dict(u)
         for _round in range(6):
-            st, data = api("GET", "/api/v1/orders?limit=500&status=new,partially_filled")
+            st, data = api("GET", "/api/v1/orders?limit=500&status=new,partially_filled,pending")
             orders = json.loads(data).get("orders", []) if st == 200 else []
             if not orders:
                 break
@@ -322,7 +324,7 @@ def p5_order_types():
     # stop/trailing state behind; the conditional-order checks below assume a
     # known book, same rationale as phase0's purge.
     for u in USERS:
-        st, data = api("GET", "/api/v1/orders?limit=500&status=new,partially_filled",
+        st, data = api("GET", "/api/v1/orders?limit=500&status=new,partially_filled,pending",
                        creds=u)
         for o in (json.loads(data).get("orders", []) if st == 200 else []):
             api("DELETE", f"/api/v1/orders/{o['id']}", creds=u)
@@ -445,6 +447,40 @@ def p5_order_types():
         _place(mk, {"symbol": SYM, "side": "sell", "type": "limit",
                     "quantity": 0.06, "price": p})
     time.sleep(0.4)
+
+    # 6y) self-trade prevention: taker skips its own liquidity
+    st, d, _ = _place(t2, {"symbol": SYM, "side": "sell", "type": "limit",
+                           "quantity": 0.01, "price": 98.8})
+    own_ask = d.get("id")
+    time.sleep(0.5)
+    st, d, _ = _place(t2, {"symbol": SYM, "side": "buy", "type": "market",
+                           "quantity": 0.005})
+    mb_id = d.get("id")
+    _wait_ev(mb_id, ("filled", "expired"), timeout=10)
+    time.sleep(1.0)
+    tr = _db_fetch("select price from trades where taker_order_id=$1", mb_id)
+    o_own = _order_status(own_ask)
+    fills_foreign = bool(tr) and float(tr[0]["price"]) >= 99.0
+    mb_o = _order_status(mb_id)
+    ck("STP: market buy skips own best ask, fills foreign level",
+       fills_foreign and o_own.get("status") == "new"
+       and mb_o.get("status") == "filled",
+       f"trade_prices={[str(x['price']) for x in tr]} buy_status={mb_o.get('status')} "
+       f"own_ask_status={o_own.get('status')}")
+    # self-only side of the book: at this point every resting bid belongs
+    # to mk, so mk's own market sell must skip all of them → no_liquidity
+    # → expired, funds released, no trades.
+    st, d, _ = _place(mk, {"symbol": SYM, "side": "sell", "type": "market",
+                           "quantity": 0.001})
+    mb2 = d.get("id")
+    _wait_ev(mb2, ("expired", "canceled", "rejected"), timeout=10)
+    time.sleep(1.0)
+    o2 = _order_status(mb2)
+    tr2 = _db_fetch("select id from trades where taker_order_id=$1", mb2)
+    ck("STP: own-only liquidity → expired, no trades, funds released",
+       o2.get("status") in ("expired", "canceled") and not tr2
+       and o2.get("locked_amount") == 0.0,
+       f"status={o2.get('status')} trades={len(tr2)} locked={o2.get('locked_amount')}")
 
     # 7) stop_market: arms in stop queue, triggers on print, child fills.
     # stop=98.4 while last print is ~99.5 → must NOT fire at registration
@@ -684,13 +720,22 @@ def main():
     p5_order_types()
 
     # cleanup: cancel resting makers
-    st, data = api("GET", "/api/v1/orders?limit=500")
-    open_orders = json.loads(data).get("orders", []) if st == 200 else []
+    # cleanup: cancel remaining open orders AS THEIR OWNER — GET /orders
+    # only ever lists the caller's own orders, so a single-user cleanup
+    # silently leaves other users' resting orders (e.g. SL/TP children of
+    # the P5 market order) armed forever in the book and the UI.
     cancels, errs2 = [], []
     t0 = time.perf_counter()
-    for o in open_orders:
-        st2, _ = api("DELETE", f"/api/v1/orders/{o['id']}")
-        cancels.append(st2 == 200)
+    for u in USERS:
+        for _round in range(4):
+            st, data = api("GET", "/api/v1/orders?limit=500&status=new,partially_filled,pending",
+                           creds=u)
+            open_orders = json.loads(data).get("orders", []) if st == 200 else []
+            if not open_orders:
+                break
+            for o in open_orders:
+                st2, _ = api("DELETE", f"/api/v1/orders/{o['id']}", creds=u)
+                cancels.append(st2 == 200)
     wall = time.perf_counter() - t0
     print(f"\ncleanup: canceled {sum(cancels)}/{len(cancels)} orders in {wall:.2f}s "
           f"({len(cancels)/max(wall,0.01):.0f} req/s single-threaded)")

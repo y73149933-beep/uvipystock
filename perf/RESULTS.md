@@ -174,3 +174,15 @@ un-reconstructable rather than armed at price 0). The benchmark harness
 now also cancels `pending` orders in its clean-slate pass, so test purges
 cannot manufacture stranded stops. Post-fix: 19/19 zombies re-armed on
 startup, then canceled cleanly through the API; final audit all-zero.
+
+## Harness cleanup was single-user (UI residue explained)
+
+The two orders visible in the web UI (limit sell 130 + stop_market sell 80)
+were the take-profit/stop-loss children of the P5 SL/TP market order, owned
+by the Post-Only bench user. The suite end-cleanup queried /api/v1/orders
+as one user only, and that endpoint lists only the caller's own orders —
+other users' resting orders were never even seen, let alone canceled.
+Cleanup now iterates all users and cancels as each owner (with rescan
+rounds, since SL/TP children appear only after their parents are canceled).
+Post-fix full suite: cleanup 26/26, audit shows 0 open orders, 0 stranded,
+0 ghosts, locks reconciled, queues empty.
