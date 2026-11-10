@@ -443,3 +443,24 @@ the anonymous book). Colors: book=green/red, my stops=amber dashed,
 public ladder=green/red hollow, mine=violet solid.
 Verified: pixel-diff violet count 0 (logged out) -> 1095 (3 own orders incl.
 iceberg @94/96/102); vision read labels "S LMT 0.2"/"B LMT 0.3" correct.
+
+## Drag-to-move own orders + filled-share on chart bars
+
+Own violet bars are now grab handles: mousedown within 5px of a level,
+drag >4px disables chart pan/zoom (chart.applyOptions handleScroll/handleScale —
+NOT timeScale().applyOptions, v4 puts them on ChartOptions), dashed violet
+ghost line + vertical link + `-> price` label track the cursor (dragState
+mutable singleton read by the overlay RAF, zero React re-renders); release
+sends cancel-replace via POST-modify with remaining qty, toast shows
+`#old moved -> #new @ price`, openOrders refetch re-anchors the bar.
+buildMyLevels() in chartOrderDrag.ts is the single source for renderer AND
+hit-test (iceberg=visible chunk, level aggregates side:price, label `#id B/S
+LMT|PO|ICE qty +filled`).
+Filled share fixed after pixel-forensics bug: live bar must stay anchored to
+the price axis and pale-outline filled segment extends LEFTWARDS — original
+order of ops drew solid over pale (invisible). Verified by pixel runs:
+pale 413..460 + solid 462..561(anchor) for 0.1 filled / 0.2 remaining.
+Drag e2e: Selenium W3C pointer down/move/up through window.__uvityChart
+(price<->pixel debug hook) moved 96->99.01: PG 28086 canceled, 28089 new @99.01.
+WARNING: t_sweep_all.py sweeps ALL users it can auth as via creds loop — it
+canceled test/test2 user ladders; run with eyes open.

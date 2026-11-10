@@ -7,6 +7,8 @@ import { DepthOverlay, PANE_DIVIDER_FRAC } from "./DepthOverlay";
 import { ChartTradePad } from "./ChartTradePad";
 import { ChartContextMenu, type ChartMenuState } from "./ChartContextMenu";
 import { useAuthStore } from "@/store/authStore";
+import { buildMyLevels, dragState, applyDragModify } from "./chartOrderDrag";
+import { useOrdersStore } from "@/store/ordersStore";
 
 const DEPTH_PREFS_KEY = "uvity.depthOverlay";
 
@@ -128,6 +130,81 @@ export function CandleChart() {
     });
   };
 
+  // grab a violet own-order bar and slide it to a new price; releasing the
+  // mouse applies a cancel-replace modify through the existing endpoint
+  const beginOrderDrag = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !isAuthenticated || !depthPrefs.myOrders) return;
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    const cont = containerRef.current;
+    if (!chart || !series || !cont) return;
+    const rect = cont.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    let axisW = 62;
+    try {
+      axisW = chart.priceScale("right").width();
+    } catch {
+      // fall back to the overlay's constant
+    }
+    if (x > rect.width - axisW) return; // pressed on the price scale itself
+    const orders = useOrdersStore.getState().openOrders;
+    const levels = buildMyLevels(orders, symbol);
+    let level = null as (typeof levels)[number] | null;
+    for (const l of levels) {
+      const ly = series.priceToCoordinate(l.price);
+      if (ly !== null && Math.abs((ly as number) - y) <= 5) {
+        level = l;
+        break;
+      }
+    }
+    if (!level) return;
+    // newest order at the level gets replaced (the UI shows #id for singles)
+    const orderId = level.orderIds[level.orderIds.length - 1];
+    const ord = orders.find((o) => o.id === orderId);
+    if (!ord) return;
+    e.preventDefault();
+
+    const startX = x;
+    const startY = y;
+    let dragging = false;
+    const setScroll = (on: boolean) => {
+      chart.applyOptions({ handleScroll: on, handleScale: on });
+    };
+    const onMove = (ev: MouseEvent) => {
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      if (!dragging && Math.abs(mx - startX) + Math.abs(my - startY) < 4) return;
+      if (!dragging) {
+        dragging = true;
+        setScroll(false);
+      }
+      const p = series.coordinateToPrice(my);
+      if (p == null) return;
+      dragState.current = {
+        symbol,
+        orderId,
+        side: level!.side,
+        oldPrice: level!.price,
+        newPrice: Number(Number(p).toFixed(2)),
+      };
+    };
+    const onUp = async () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (!dragging) return; // plain click on my bar — no side effects yet
+      setScroll(true);
+      const d = dragState.current;
+      dragState.current = null;
+      if (!d || d.newPrice === d.oldPrice) return;
+      const r = await applyDragModify(orderId, d.newPrice.toFixed(2), ord.remaining_quantity);
+      setChartMsg(r);
+      void useOrdersStore.getState().fetchOpenOrders();
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   const toggleDepth = (key: keyof DepthPrefs) => {
     setDepthPrefs((prev) => {
       const next = { ...prev, [key]: !prev[key] };
@@ -208,6 +285,8 @@ export function CandleChart() {
     });
 
     chartRef.current = chart;
+    // test/debug hook: headless e2e translates price<->pixel through this
+    (window as unknown as { __uvityChart?: { chart: IChartApi; series: ISeriesApi<"Candlestick"> } }).__uvityChart = { chart, series };
     seriesRef.current = series;
     volumeRef.current = volume;
     setChartApi(chart);
@@ -251,6 +330,8 @@ export function CandleChart() {
       resizeObserver.disconnect();
       chart.remove();
       chartRef.current = null;
+    dragState.current = null;
+    (window as unknown as { __uvityChart?: unknown }).__uvityChart = undefined;
       seriesRef.current = null;
       volumeRef.current = null;
       setChartApi(null);
@@ -376,6 +457,7 @@ export function CandleChart() {
         ref={containerRef}
         className="relative flex-1 min-h-0"
         onContextMenu={openMenuAtCursor}
+        onMouseDown={beginOrderDrag}
         onClick={() => setMenu(null)}
       >
         {loading && (

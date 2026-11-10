@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { IChartApi, ISeriesApi } from "lightweight-charts";
 import { useOrderbookStore } from "@/store/orderbookStore";
+import { buildMyLevels, dragState } from "./chartOrderDrag";
 import { useOrdersStore } from "@/store/ordersStore";
 import { useStopLadderStore } from "@/store/stopLadderStore";
 
@@ -73,7 +74,6 @@ const STOP_TEXT_COLOR = "#fbbf24";
 /** own resting orders: violet — distinct from book (green/red) and stops (amber) */
 const MINE_COLOR = (a: number) => `rgba(139, 92, 246, ${a})`;
 const MINE_TEXT_COLOR = "#c4b5fd";
-const RESTING_TYPES = ["limit", "post_only", "iceberg"] as const;
 
 // fallbacks in case axis measurement is unavailable
 const FALLBACK_RIGHT_AXIS_W = 62;
@@ -266,55 +266,81 @@ export function DepthOverlay({
 
       // ---- my resting orders (violet bars over the anonymous depth) ----
       if (withMine && paneW > 0) {
-        const orders = useOrdersStore.getState().openOrders;
-        const mine = new Map<string, { side: string; price: number; qty: number; kind: string }>();
-        for (const o of orders) {
-          if (o.symbol !== ob.symbol) continue;
-          if (o.status !== "new" && o.status !== "partially_filled") continue;
-          if (!(RESTING_TYPES as readonly string[]).includes(o.type)) continue;
-          if (o.price === null) continue;
-          const p = Number(o.price);
-          const q = parseFloat(o.remaining_quantity);
-          if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(q) || q <= 0) continue;
-          // iceberg: the book only ever shows the visible chunk
-          const shown =
-            o.type === "iceberg" && o.visible_quantity
-              ? Math.min(q, parseFloat(o.visible_quantity) || q)
-              : q;
-          const key = `${o.side}:${p}`;
-          const cur = mine.get(key);
-          if (cur) cur.qty += shown;
-          else
-            mine.set(key, {
-              side: o.side,
-              price: p,
-              qty: shown,
-              kind: o.type === "iceberg" ? "ICE" : o.type === "post_only" ? "PO" : "LMT",
-            });
-        }
-        if (mine.size > 0) {
-          // scale bars against the SAME max as the anonymous book so my size
-          // is directly comparable with the depth behind it
+        const levels = buildMyLevels(useOrdersStore.getState().openOrders, ob.symbol);
+        if (levels.length > 0) {
+          // scale against the SAME max as the anonymous book so my bar sizes
+          // are directly comparable with the depth behind them
           let scale = 0;
           for (const l of ob.bids) if (l.volume > scale) scale = l.volume;
           for (const l of ob.asks) if (l.volume > scale) scale = l.volume;
-          for (const m of mine.values()) if (m.qty > scale) scale = m.qty;
+          for (const m of levels) {
+            const tot = m.qty + m.filled;
+            if (tot > scale) scale = tot;
+          }
 
           ctx.font = "600 9px 'JetBrains Mono', monospace";
           ctx.textBaseline = "alphabetic";
-          for (const m of mine.values()) {
+          for (const m of levels) {
             const y = toY(m.price);
             if (y === null || y < -3 || y > paneH + 3) continue;
             const w = Math.max(8, (m.qty / scale) * maxBarW);
+            // live share anchored to the price axis; the already-filled share
+            // extends the violet span LEFTWARDS in a paler outline tone:
+            // full span = original order size
             ctx.fillStyle = MINE_COLOR(0.95);
             ctx.fillRect(anchorX - w, y - 2, w, 4);
-            // notch at the bar's left end so my rows are findable even at w=min
-            ctx.fillRect(anchorX - w - 3, y - 5, 2, 10);
-            const label = `${m.side === "buy" ? "B" : "S"} ${m.kind} ${m.qty}`;
+            let xStart = anchorX - w;
+            if (m.filled > 0) {
+              const fw = Math.max(2, (m.filled / scale) * maxBarW);
+              xStart -= fw;
+              ctx.fillStyle = MINE_COLOR(0.35);
+              ctx.fillRect(xStart, y - 2, fw, 4);
+              ctx.strokeStyle = MINE_COLOR(0.65);
+              ctx.lineWidth = 1;
+              ctx.strokeRect(xStart + 0.5, y - 1.5, fw - 1, 3);
+            }
+            // notch at the bar's left end: grab handle affordance
+            ctx.fillRect(xStart - 3, y - 5, 2, 10);
+            const kind = m.kinds.size === 1 ? [...m.kinds][0] : "MIX";
+            const who = m.orderIds.length === 1 ? `#${m.orderIds[0]} ` : "";
+            const label = `${who}${m.side === "buy" ? "B" : "S"} ${kind} ${m.qty}${m.filled > 0 ? ` +${m.filled}` : ""}`;
             const tw = ctx.measureText(label).width;
             ctx.fillStyle = MINE_TEXT_COLOR;
-            ctx.fillText(label, Math.max(4, anchorX - w - 6 - tw), y + 3);
+            ctx.fillText(label, Math.max(4, xStart - 6 - tw), y + 3);
           }
+        }
+      }
+
+      // ---- drag ghost: live preview while moving my order ---------------
+      const drag = dragState.current;
+      if (drag && drag.symbol === ob.symbol) {
+        const y = toY(drag.newPrice);
+        if (y !== null && y > 2 && y < paneH - 2) {
+          ctx.save();
+          ctx.strokeStyle = MINE_COLOR(0.9);
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(4, y + 0.5);
+          ctx.lineTo(paneW - 2, y + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          const yOld = toY(drag.oldPrice);
+          if (yOld !== null && yOld > 2 && yOld < paneH - 2) {
+            ctx.strokeStyle = MINE_COLOR(0.4);
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 3]);
+            ctx.beginPath();
+            ctx.moveTo(paneW - 10, yOld + 0.5);
+            ctx.lineTo(paneW - 10, y + 0.5);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+          ctx.font = "600 10px 'JetBrains Mono', monospace";
+          ctx.textBaseline = "alphabetic";
+          ctx.fillStyle = MINE_TEXT_COLOR;
+          ctx.fillText(`\u2192 ${drag.newPrice.toFixed(2)}`, 8, y > (yOld ?? 0) ? y - 6 : y + 14);
+          ctx.restore();
         }
       }
 
