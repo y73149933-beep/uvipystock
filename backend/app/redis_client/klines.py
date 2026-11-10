@@ -8,7 +8,12 @@ candle``. The settlement path bumps the affected bucket on every fill
 window that has never been materialized from PG, so a chart request never
 re-aggregates the same span of trades twice. A sentinel key
 ``kline:{symbol}:{tf}:seeded_from`` records the oldest bucket (unix
-seconds) covered by the cache.
+seconds) ever materialized — but coverage is verified against the cache
+itself, never the sentinel alone: the 50k-bucket cap trims old buckets,
+so a sentinel that merely claims coverage would permanently hide those
+windows from re-materialization. The cache key therefore carries no idle
+TTL: memory is bounded by the cap (6 timeframes x 50k compact candles
+is ~10MB), while an expiry would strand the sentinel over a dead key.
 
 Concurrency model: exactly one worker settles trades per deployment
 (single-writer assumption), so bucket read-modify-write needs no lock.
@@ -39,7 +44,6 @@ TF_SECONDS: dict[str, int] = {
 # Hard cap per (symbol, timeframe) so the cache cannot grow unbounded on
 # 1m buckets; oldest buckets are dropped first.
 MAX_CANDLES_PER_TF = 50_000
-CACHE_TTL_SECONDS = 30 * 24 * 3600
 
 
 def bucket_of(ts_seconds: float, tf_seconds: int) -> int:
@@ -110,7 +114,6 @@ async def apply_trades(
             pipe.zrem(key, old_member)
         member = json.dumps({"t": bucket, **candle}, separators=(",", ":"))
         pipe.zadd(key, {member: bucket})
-        pipe.expire(key, CACHE_TTL_SECONDS)
         pipe.zremrangebyrank(key, 0, -(MAX_CANDLES_PER_TF + 1))
         updated.append({"tf": tf, "bucket": bucket, **candle})
     await pipe.execute()
@@ -151,7 +154,6 @@ async def aggregate_window(
             # drop any stale cached member for this bucket, then write truth
             pipe.zremrangebyscore(key, b, b)
             pipe.zadd(key, {member: b})
-        pipe.expire(key, CACHE_TTL_SECONDS)
         pipe.zremrangebyrank(key, 0, -(MAX_CANDLES_PER_TF + 1))
         await pipe.execute()
 
@@ -170,7 +172,14 @@ async def ensure_window(
     anything ever materialized."""
     prev = await redis.get(seeded_key(symbol, tf))
     if prev is not None and lo_bucket >= int(prev):
-        return  # window fully covered by the cache
+        oldest = await redis.zrange(kline_key(symbol, tf), 0, 0, withscores=True)
+        if oldest and float(oldest[0][1]) <= lo_bucket:
+            return  # window truly covered: trim only ever drops the oldest
+        if not oldest and not await has_older_trades(session, symbol, hi_bucket_exclusive):
+            return  # empty cache over a symbol that simply has no older trades
+        # else: the cap trimmed into this window (or the key died): the
+        # sentinel must not block backfill. Windows outside the cap pay
+        # one PG re-aggregation per read — that is the cap's price.
     written = await aggregate_window(session, redis, symbol, tf, lo_bucket, hi_bucket_exclusive)
     logger.debug(
         "klines seeded %s %s [%d,%d): %d buckets", symbol, tf, lo_bucket, hi_bucket_exclusive, written,

@@ -100,6 +100,9 @@ async def test_ensure_window_skips_db_when_covered(redis):
     """A window at/after the seeded floor must not hit the DB (session
     would raise if touched)."""
     await redis.set(klines.seeded_key("BTC/USD", "1m"), "6000")
+    # coverage is verified against the cache itself: put a real bucket at
+    # the window's left edge so the fast path is legitimately hit
+    await klines.apply_trades(redis, "BTC/USD", [(10.0, 1.0, 6065)])
     await klines.ensure_window(None, redis, "BTC/USD", "1m", 6060, 6240)  # type: ignore[arg-type]
     # still one sentinel, untouched
     assert int(await redis.get(klines.seeded_key("BTC/USD", "1m"))) == 6000
@@ -159,3 +162,62 @@ def test_fill_gaps_empty_page_with_seed_is_all_flat():
 
 def test_fill_gaps_empty_page_no_seed_stays_empty():
     assert klines.fill_gaps([], 60, 600, 780, None) == []
+
+
+# ---------- ensure_window coverage vs sentinel/cap divergence ----------
+
+@pytest.mark.asyncio
+async def test_ensure_window_rebackfills_when_cache_lost(redis, monkeypatch):
+    """Sentinel claims coverage but the cache key is gone (expiry/FLUSHDB):
+    backfill MUST re-run, never trust the sentinel alone."""
+    await redis.set(klines.seeded_key("BTC/USD", "1m"), "6000")
+    called = {"agg": 0}
+
+    async def fake_agg(session, r, symbol, tf, lo, hi):
+        called["agg"] += 1
+        return 0
+
+    async def fake_has_older(session, symbol, before_bucket):
+        return True
+
+    monkeypatch.setattr(klines, "aggregate_window", fake_agg)
+    monkeypatch.setattr(klines, "has_older_trades", fake_has_older)
+    await klines.ensure_window(None, redis, "BTC/USD", "1m", 6120, 6300)  # type: ignore[arg-type]
+    assert called["agg"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_window_rebackfills_when_cap_trimmed_into_window(redis, monkeypatch):
+    """Cache exists but its oldest bucket is newer than the window (the
+    cap trimmed into it): the window must be re-materialized from PG."""
+    await redis.set(klines.seeded_key("BTC/USD", "1m"), "3000")
+    await klines.apply_trades(redis, "BTC/USD", [(10.0, 1.0, 6125)])  # oldest cached: 6120
+    called = {"agg": 0}
+
+    async def fake_agg(session, r, symbol, tf, lo, hi):
+        called["agg"] += 1
+        return 0
+
+    monkeypatch.setattr(klines, "aggregate_window", fake_agg)
+    await klines.ensure_window(None, redis, "BTC/USD", "1m", 6000, 6300)  # type: ignore[arg-type]
+    assert called["agg"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_window_empty_cache_no_trades_skips_agg(redis, monkeypatch):
+    """Empty cache + sentinel + no trades in PG before the window: nothing
+    to materialize, skip without re-aggregating on every request."""
+    await redis.set(klines.seeded_key("BTC/USD", "1m"), "6000")
+    called = {"agg": 0}
+
+    async def fake_agg(session, r, symbol, tf, lo, hi):
+        called["agg"] += 1
+        return 0
+
+    async def fake_has_older(session, symbol, before_bucket):
+        return False
+
+    monkeypatch.setattr(klines, "aggregate_window", fake_agg)
+    monkeypatch.setattr(klines, "has_older_trades", fake_has_older)
+    await klines.ensure_window(None, redis, "BTC/USD", "1m", 6120, 6300)  # type: ignore[arg-type]
+    assert called["agg"] == 0

@@ -303,3 +303,23 @@ book was empty stayed out (canceled, in_book=False); iceberg HASH
 quantity/visible/hidden intact; open index complete. Negative control:
 after cleanup (0 open orders) a flushall correctly re-registers nothing.
 Regressions: takers 100/100, P5 19/19, cleanup 26/26.
+
+## Kline cache: sentinel no longer trusted blindly; idle TTL removed
+
+The 30-day idle TTL and the eternal seeded_from sentinel diverged: after
+the key expired (or after the 50k-bucket cap trimmed into a window),
+ensure_window's `lo >= seeded_from` fast path declared the window
+covered and backfill NEVER re-ran -> permanently empty history. Fixes:
+- cache keys carry no TTL now (memory is bounded by the 50k cap:
+  ~10MB total across 6 timeframes);
+- ensure_window verifies coverage against the oldest bucket actually in
+  the cache (trim only removes from the oldest end); sentinel alone can
+  never skip backfill;
+- empty cache consults PG once (has_older_trades) so symbols with no
+  history do not re-aggregate every request;
+- windows older than the cap pay one PG re-aggregation per read by
+  design (the cap's price).
+Live repro: DEL kline:BTC/USD:1m while the sentinel stayed -> first
+request re-materialized all 16 real buckets, second hit the fast path,
+identical content; ttl is now -1. Unit tests: 15 klines (3 new for
+coverage divergence) + 33 engine = 48 green.
