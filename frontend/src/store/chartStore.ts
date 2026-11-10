@@ -26,6 +26,7 @@ interface ChartState {
   addTradeToCandle: (price: number, qty: number, tsMs?: number) => void;
   fetchCandles: (symbol: string, timeframe: string) => Promise<void>;
   loadOlder: () => Promise<void>;
+  syncRecent: () => Promise<void>;
 }
 
 const MAX_CANDLES = 2000;
@@ -86,6 +87,31 @@ export const useChartStore = create<ChartState>((set, get) => ({
             hasMore: more, olderCursor: cursor });
     } catch {
       set({ loading: false, candles: [], hasMore: false, olderCursor: null });
+    }
+  },
+
+  // WS reconnect gap-filler: fetch only the newest window and merge by
+  // bucket time. The server (kline cache) is authoritative — its buckets
+  // overwrite any bucket the client bucketed live while we were
+  // connected, and fills in buckets that happened while we were offline.
+  // Older scroll-loaded pages stay untouched.
+  syncRecent: async () => {
+    const { symbol, timeframe } = get();
+    try {
+      const resp = await tradesApi.getCandles(symbol, timeframe, 500);
+      const fresh = resp.candles || [];
+      if (fresh.length === 0) return;
+      set((state) => {
+        const byTime = new Map(state.candles.map((c) => [c.time, c]));
+        for (const c of fresh) byTime.set(c.time, c);
+        const merged = [...byTime.values()]
+          .sort((a, b) => a.time - b.time)
+          .slice(-MAX_CANDLES);
+        return { candles: merged };
+      });
+      console.log("[chart] backfilled candles after WS reconnect");
+    } catch {
+      // transient REST failure; the next trade event or page reload recovers
     }
   },
 

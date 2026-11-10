@@ -323,3 +323,21 @@ Live repro: DEL kline:BTC/USD:1m while the sentinel stayed -> first
 request re-materialized all 16 real buckets, second hit the fast path,
 identical content; ttl is now -1. Unit tests: 15 klines (3 new for
 coverage divergence) + 33 engine = 48 green.
+
+## WS reconnect backfill
+
+PublicSocket emits a synthetic client-side "reconnected" event on every
+re-open (not the first connect). The feed handler reacts by refetching
+the public trades tape (fetchRecent — replaces, dedupe by trade_id) and
+merging the newest 500-bucket candle window into the chart store by
+bucket time (server kline cache is authoritative; client live-bucketed
+bars get overwritten; older scroll-loaded pages untouched).
+
+E2E (deterministic): backend restart kills the socket, nginx blocks
+/api/v1/ws (busybox-safe one-line sed; REST stays up), 3 market trades
+execute between different users while the browser cannot receive them,
+unblock -> client reconnects (2 backoff attempts), logs
+"[feed] WS reconnected" + "[chart] backfilled candles", tape top rows
+exactly equal the 3 gap trades from PG.
+Side-finding: same-user bid+market during the experiment EXPIRED —
+correct STP behavior, not a bug.

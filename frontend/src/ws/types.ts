@@ -6,6 +6,7 @@ export type WSEventType =
   | "stops_changed"
   | "trade"
   | "order"
+  | "reconnected"
   | "balance"
   | "bulk_result"
   | "sl_tp_activated"
@@ -19,6 +20,13 @@ export type WSEventType =
 export interface WSMessageBase {
   event: WSEventType;
   ts: number;
+}
+
+/** Synthetic client-side event: the public socket re-established after a
+ * disconnect. Not sent by the server — emitted by PublicSocket.onopen. */
+export interface ReconnectedMsg extends WSMessageBase {
+  event: "reconnected";
+  symbol: string;
 }
 
 export interface OrderBookSnapshotMsg extends WSMessageBase {

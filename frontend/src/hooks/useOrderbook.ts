@@ -37,6 +37,17 @@ export function useOrderbookFeed(symbol: string) {
             void fetchLadder(symbol);
           }
           break;
+        case "reconnected":
+          // Recover everything the offline period swallowed: the trades
+          // tape is replaced from the public endpoint (dedupe by
+          // trade_id is handled by refetch), candles merged by bucket.
+          if (msg.symbol === symbol) {
+            console.log("[feed] WS reconnected — backfilling trades + candles");
+            void useTradesStore.getState().fetchRecent(symbol);
+            void useChartStore.getState().syncRecent();
+          }
+          break;
+
         case "trade":
           addTrade(msg);
           applyTradeOptimistic(msg.price, msg.quantity, msg.side);

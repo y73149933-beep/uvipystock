@@ -1,4 +1,4 @@
-import type { OrderBookSnapshotMsg, OrderBookUpdateMsg, StopsChangedMsg, TradePrintMsg } from "./types";
+import type { OrderBookSnapshotMsg, OrderBookUpdateMsg, ReconnectedMsg, StopsChangedMsg, TradePrintMsg } from "./types";
 
 /**
  * Public WebSocket client for orderbook + trades streams.
@@ -7,7 +7,7 @@ import type { OrderBookSnapshotMsg, OrderBookUpdateMsg, StopsChangedMsg, TradePr
  * Sends periodic pings to keep the connection alive.
  */
 
-type MessageHandler = (msg: OrderBookSnapshotMsg | OrderBookUpdateMsg | StopsChangedMsg | TradePrintMsg) => void;
+type MessageHandler = (msg: OrderBookSnapshotMsg | OrderBookUpdateMsg | StopsChangedMsg | TradePrintMsg | ReconnectedMsg) => void;
 
 export class PublicSocket {
   private ws: WebSocket | null = null;
@@ -19,6 +19,7 @@ export class PublicSocket {
   private reconnectDelay = 1000;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private shouldReconnect = true;
+  private hadOpen = false;
 
   constructor(symbol: string, wsBase?: string) {
     this.symbol = symbol;
@@ -43,8 +44,17 @@ export class PublicSocket {
 
     this.ws.onopen = () => {
       console.log(`[PublicSocket] Connected to ${this.symbol}`);
+      const isReconnect = this.hadOpen;
+      this.hadOpen = true;
       this.reconnectAttempts = 0;
       this._startPing();
+      if (isReconnect) {
+        // Any event missed while offline must be recovered from REST:
+        // tell subscribers so they can refetch trades + candles.
+        this.handlers.forEach((h) => h({
+          event: "reconnected", symbol: this.symbol, ts: Date.now(),
+        }));
+      }
     };
 
     this.ws.onmessage = (event) => {
