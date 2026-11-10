@@ -35,7 +35,7 @@ def test_bucket_of_aligns_to_tf():
     assert klines.bucket_of(1259, 60) == 1200
     assert klines.bucket_of(1260, 60) == 1260
     assert klines.bucket_of(1234, 3600) == 0
-    assert klines.bucket_of(1794313699, 900) == 1794313500
+    assert klines.bucket_of(1794313699, 900) == 1794312900
 
 
 def test_bump_new_and_fold():
@@ -82,10 +82,14 @@ async def test_get_range_window_and_order(redis):
     await klines.apply_trades(redis, "BTC/USD", [(10.0, 1.0, base + s) for s in (0, 120, 180)])
     # [6000..6180] ascending
     got = await klines.get_range(redis, "BTC/USD", "1m", 6000, 6180, 10)
-    assert [c["time"] for c in got] == [6000, 6120, 6180]
-    # exclusive upper bound at 6120 keeps it out
+    # the idle 6060 bucket is filled with a synthetic flat bar
+    assert [c["time"] for c in got] == [6000, 6060, 6120, 6180]
+    flat = got[1]
+    assert flat["volume"] == 0.0 and flat["open"] == flat["close"] == 10.0
+    # exclusive upper bound at 6120 keeps it out; trailing 6060 is flat-filled
     got = await klines.get_range(redis, "BTC/USD", "1m", 6000, 6060, 10)
-    assert [c["time"] for c in got] == [6000]
+    assert [c["time"] for c in got] == [6000, 6060]
+    assert got[1]["volume"] == 0.0
     # limit keeps the most recent
     got = await klines.get_range(redis, "BTC/USD", "1m", 6000, 6180, 2)
     assert [c["time"] for c in got] == [6120, 6180]
@@ -98,7 +102,7 @@ async def test_ensure_window_skips_db_when_covered(redis):
     await redis.set(klines.seeded_key("BTC/USD", "1m"), "6000")
     await klines.ensure_window(None, redis, "BTC/USD", "1m", 6060, 6240)  # type: ignore[arg-type]
     # still one sentinel, untouched
-    assert await redis.get(klines.seeded_key("BTC/USD", "1m")) == "6000"
+    assert int(await redis.get(klines.seeded_key("BTC/USD", "1m"))) == 6000
 
 
 @pytest.mark.asyncio
@@ -109,5 +113,49 @@ async def test_trim_keeps_recent_buckets(redis, monkeypatch):
         await klines.apply_trades(redis, "BTC/USD", [(10.0, 1.0, base + i * 60)])
     n = await redis.zcard(klines.kline_key("BTC/USD", "1m"))
     assert n == 3
-    got = await klines.get_range(redis, "BTC/USD", "1m", 0, 10 ** 12, 100)
+    got = await klines.get_range(redis, "BTC/USD", "1m", 6000, base + 300, 100)
     assert [c["time"] for c in got] == [base + 180, base + 240, base + 300]
+
+
+# ---------- fill_gaps (synthetic idle bars) ----------
+
+def test_fill_gaps_middle_and_trailing():
+    tf = 60
+    c = [
+        {"time": 600, "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 1},
+        {"time": 900, "open": 10.5, "high": 12, "low": 10, "close": 11, "volume": 2},
+    ]
+    out = klines.fill_gaps(c, tf, 600, 1020, None)
+    times = [x["time"] for x in out]
+    assert times == [600, 660, 720, 780, 840, 900, 960, 1020]
+    mid = [x for x in out if x["volume"] == 0.0]
+    assert len(mid) == 6  # 4 middle + 2 trailing
+    # middle bars carry the previous real close (10.5), trailing bars the
+    # last real close (11.0)
+    assert all(x["open"] == x["close"] == 10.5 for x in mid[:4])
+    assert all(x["open"] == x["close"] == 11.0 for x in mid[4:])
+
+
+def test_fill_gaps_no_invention_before_first_trade():
+    tf = 60
+    c = [{"time": 600, "open": 10, "high": 10, "low": 10, "close": 10, "volume": 1}]
+    out = klines.fill_gaps(c, tf, 300, 720, None)
+    assert [x["time"] for x in out] == [600, 660, 720]
+
+
+def test_fill_gaps_leading_only_with_seed():
+    tf = 60
+    c = [{"time": 480, "open": 12, "high": 12, "low": 12, "close": 12, "volume": 1}]
+    out = klines.fill_gaps(c, tf, 300, 480, 11.0)
+    assert [x["time"] for x in out] == [300, 360, 420, 480]
+    assert out[0]["close"] == 11.0 and out[0]["volume"] == 0.0
+
+
+def test_fill_gaps_empty_page_with_seed_is_all_flat():
+    out = klines.fill_gaps([], 60, 600, 780, 9.0)
+    assert [x["time"] for x in out] == [600, 660, 720, 780]
+    assert all(x["volume"] == 0.0 and x["close"] == 9.0 for x in out)
+
+
+def test_fill_gaps_empty_page_no_seed_stays_empty():
+    assert klines.fill_gaps([], 60, 600, 780, None) == []

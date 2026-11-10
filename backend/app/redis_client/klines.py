@@ -177,12 +177,60 @@ async def ensure_window(
     )
 
 
+def fill_gaps(
+    candles: list[dict[str, Any]], tf_seconds: int,
+    lo_bucket: int, hi_bucket_inclusive: int, seed_close: float | None,
+) -> list[dict[str, Any]]:
+    """Insert synthetic flat bars into buckets that hold no trades.
+
+    A gap is filled only where trading had already started: between two
+    returned candles, after the last candle up to the window edge, and at
+    the window start when ``seed_close`` (close of the last candle just
+    older than ``lo_bucket``) is known. A synthetic bar carries
+    open=high=low=close=previous close with volume=0, so idle periods
+    render as a continuous flat stretch instead of missing time.
+    Buckets before the very first trade are never invented.
+    Pure function; output stays ascending.
+    """
+    def flat(bucket: int, close: float) -> dict[str, Any]:
+        return {"time": bucket, "open": close, "high": close,
+                "low": close, "close": close, "volume": 0.0}
+
+    out: list[dict[str, Any]] = []
+    prev_close = seed_close
+    prev_t = lo_bucket - tf_seconds  # leading fill starts at lo_bucket
+    for c in candles:
+        if prev_close is not None:
+            b = prev_t + tf_seconds
+            while b < c["time"]:
+                out.append(flat(b, prev_close))
+                b += tf_seconds
+        out.append(c)
+        prev_close = c["close"]
+        prev_t = c["time"]
+    if prev_close is not None:
+        b = prev_t + tf_seconds
+        while b <= hi_bucket_inclusive:
+            out.append(flat(b, prev_close))
+            b += tf_seconds
+    return out
+
+
 async def get_range(
     redis: Redis, symbol: str, tf: str, lo_bucket: int, hi_bucket_inclusive: int, limit: int,
 ) -> list[dict[str, Any]]:
-    """Candles in [lo, hi] ascending (at most ``limit`` most recent)."""
+    """Candles in [lo, hi] ascending (at most ``limit`` real candles, plus
+    synthetic flat bars filling trade-less buckets - see :func:`fill_gaps`,
+    so the synthetic output can exceed ``limit`` by up to the window's
+    bucket count)."""
+    key = kline_key(symbol, tf)
+    tf_s = TF_SECONDS[tf]
+    # Guard against caller windows far beyond the cache capacity: an
+    # unbounded window would turn gap filling into a memory bomb.
+    if hi_bucket_inclusive - lo_bucket > tf_s * MAX_CANDLES_PER_TF:
+        lo_bucket = hi_bucket_inclusive - tf_s * MAX_CANDLES_PER_TF
     members = await redis.zrevrangebyscore(
-        kline_key(symbol, tf), hi_bucket_inclusive, lo_bucket, start=0, num=limit,
+        key, hi_bucket_inclusive, lo_bucket, start=0, num=limit,
     )
     out: list[dict[str, Any]] = []
     for m in reversed(members):
@@ -194,7 +242,18 @@ async def get_range(
             })
         except (ValueError, TypeError, KeyError):
             logger.warning("dropping malformed kline member for %s %s", symbol, tf)
-    return out
+
+    # Close of the newest candle before the window: seeds the leading
+    # synthetic run (trading already started) and page-join continuity.
+    seed_close: float | None = None
+    seed = await redis.zrevrangebyscore(key, lo_bucket - 1, "-inf", start=0, num=1)
+    if seed:
+        try:
+            seed_close = float(json.loads(seed[0])["close"])
+        except (ValueError, TypeError, KeyError):
+            seed_close = None
+
+    return fill_gaps(out, tf_s, lo_bucket, hi_bucket_inclusive, seed_close)
 
 
 async def has_older_trades(
@@ -215,5 +274,6 @@ def _ts(bucket: int):
 __all__ = [
     "TF_SECONDS", "MAX_CANDLES_PER_TF", "bucket_of", "kline_key", "seeded_key",
     "bump", "apply_trades", "aggregate_window", "ensure_window", "get_range",
+    "fill_gaps",
     "has_older_trades",
 ]
