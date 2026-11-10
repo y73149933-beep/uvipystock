@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { createChart, ColorType, type IChartApi, type ISeriesApi, type LogicalRange, type Range, type Time, type UTCTimestamp } from "lightweight-charts";
+import { createChart, ColorType, TickMarkType, type IChartApi, type ISeriesApi, type LogicalRange, type Range, type Time, type UTCTimestamp } from "lightweight-charts";
 import { useChartStore } from "@/store/chartStore";
 import { useOrderbookStore } from "@/store/orderbookStore";
 import { ChartToolbar } from "./ChartToolbar";
@@ -45,10 +45,13 @@ function fmtNum(v: number): string {
 }
 
 function fmtTime(t: number, tf: string): string {
+  // browser-local timezone: the tape/tables already render local, the
+  // chart axis is localized too (see tickMarkFormatter below) - one
+  // clock across the whole UI
   const d = new Date(t * 1000);
-  const hh = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
-  if (tf === "1d") return d.toISOString().slice(0, 10);
-  if (tf === "4h" || tf === "1h") return `${d.toISOString().slice(5, 10)} ${hh}`;
+  const hh = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (tf === "1d") return d.toLocaleDateString(undefined, { year: "numeric", month: "2-digit", day: "2-digit" });
+  if (tf === "4h" || tf === "1h") return `${d.toLocaleDateString(undefined, { month: "2-digit", day: "2-digit" })} ${hh}`;
   return hh;
 }
 
@@ -120,6 +123,28 @@ export function CandleChart() {
         borderColor: "#0f3460",
         timeVisible: true,
         secondsVisible: false,
+        // lightweight-charts formats ticks in UTC by default; mirror the
+        // built-in layout but in browser-local time so the axis agrees
+        // with the trades tape and order tables
+        tickMarkFormatter: (time: Time, type: TickMarkType) => {
+          const d = new Date((time as number) * 1000);
+          switch (type) {
+            case TickMarkType.Year:
+              return String(d.getFullYear());
+            case TickMarkType.Month:
+              return d.toLocaleDateString(undefined, { month: "short" });
+            case TickMarkType.DayOfMonth:
+              return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+            default:
+              return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+          }
+        },
+      },
+      localization: {
+        timeFormatter: (time: Time) => {
+          const d = new Date((time as number) * 1000);
+          return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+        },
       },
       rightPriceScale: { borderColor: "#0f3460" },
       crosshair: { mode: 1 },

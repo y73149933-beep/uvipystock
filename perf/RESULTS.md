@@ -341,3 +341,18 @@ unblock -> client reconnects (2 backoff attempts), logs
 exactly equal the 3 gap trades from PG.
 Side-finding: same-user bid+market during the experiment EXPIRED —
 correct STP behavior, not a bug.
+
+## Chart timezone unified with the rest of the UI
+
+Symptom: trades tape/orders showed browser-local time while the chart
+axis/crosshair were UTC (lightweight-charts default) — off by the user's
+UTC+7 offset. Fixes in CandleChart.tsx: timeScale.tickMarkFormatter
+(mirrors built-in Year/Month/DayOfMonth/Time layout, local getters;
+enum member is DayOfMonth in 4.2), localization.timeFormatter for the
+crosshair label ("Nov 11 01:01"), and the OHLC legend switched from
+getUTC* to local. Bucket VALUES remain epoch seconds (timezone-free).
+
+Verified with selen recreated TZ=Asia/Barnaul: tape 23:44:19 local,
+axis ticks 19:00/22:00 local, crosshair "Nov 11 01:01" == legend 01:01
+== PG 18:01Z. Note: Chrome --timezone flag is ignored by
+standalone-chrome; set TZ on the container instead.
