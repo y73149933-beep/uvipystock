@@ -186,3 +186,24 @@ Cleanup now iterates all users and cancels as each owner (with rescan
 rounds, since SL/TP children appear only after their parents are canceled).
 Post-fix full suite: cleanup 26/26, audit shows 0 open orders, 0 stranded,
 0 ghosts, locks reconciled, queues empty.
+
+## Post-load balance reconciliation (perf42, 2026-11-10)
+
+Full suite run (P1-P5 + STP checks, 100/100 takers filled) followed by a
+money-flow audit: for every trade since baseline, buyer pays quote and
+receives base, seller the mirror; expected per-user/asset balances
+compared against the deterministic phase0 baseline (USD 5,000,000 /
+BTC 2,000) plus recorded trade deltas, exact numeric comparison.
+
+- 232 trades, 122.64 USD / 1.2290 BTC notional;
+- all 5 bench users reconcile to zero difference; untouched users
+  show exactly zero delta;
+- asset conservation: sum of deltas across users = 0.000000000000000000
+  for both BTC and USD — no leak, no double-settlement;
+- total_balance - locked_balance == available_balance on every row,
+  all locks released (0 open orders).
+
+Note: taker_fee/maker_fee are recorded as 0 by design today
+(trade_service has a TODO to compute fees from pair settings) — the
+reconciliation validates principal movement; when fees are implemented
+this same audit must extend to fee accounting (fee wallet).
