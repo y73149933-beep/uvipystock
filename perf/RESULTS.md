@@ -388,3 +388,15 @@ avg 97.0710 -> 97.3381, qty returns to 1.239; selenium tab dump matches
 to the cent. NOTE: order payload field is `type`, not `order_type` (422);
 market taker 400s when its maker leg has not landed in the book yet —
 space the two legs a moment apart.
+
+## My Trades history tab
+
+Third footer tab (Open Orders | Positions & PnL | My Trades) backed by the
+existing GET /api/v1/trades (offset pagination, filters already server-side).
+tradeHistoryStore (50/page, hasMore = page full, debounced WS refill refresh),
+MyTradesTable shows the EFFECTIVE side — the row `side` is the taker's, so
+maker rows invert; columns time/symbol/side/price/qty/total/role/fee.
+Verified vs PG for bench1: maker row side=buy@99 renders Sell (user sold),
+buy@98 renders Buy; 50 rows -> Load older -> 100.
+Landmine again: docker -v of a non-existent /tmp file creates a ROOT-owned
+directory that blocks scp; sudo rmdir it (happened twice: perf_suite, ui_mytrades).

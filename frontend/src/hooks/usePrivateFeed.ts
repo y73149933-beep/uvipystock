@@ -4,6 +4,7 @@ import { useAuthStore } from "@/store/authStore";
 import { useBalanceStore } from "@/store/balanceStore";
 import { useOrdersStore } from "@/store/ordersStore";
 import { schedulePositionsRefresh } from "@/store/positionStore";
+import { scheduleMyTradesRefresh } from "@/store/tradeHistoryStore";
 
 export type PrivateFeedStatus = "connecting" | "authenticating" | "connected" | "disconnected" | "error";
 
@@ -41,6 +42,7 @@ export function usePrivateFeed() {
           // fills change cost basis / realized PnL; debounced refetch
           if (msg.status === "filled" || msg.status === "partially_filled") {
             schedulePositionsRefresh();
+            scheduleMyTradesRefresh();
           }
           break;
         case "bulk_result":
