@@ -356,3 +356,14 @@ Verified with selen recreated TZ=Asia/Barnaul: tape 23:44:19 local,
 axis ticks 19:00/22:00 local, crosshair "Nov 11 01:01" == legend 01:01
 == PG 18:01Z. Note: Chrome --timezone flag is ignored by
 standalone-chrome; set TZ on the container instead.
+
+## Trades tape order flipped after page reload
+
+Symptom: fresh trades appear in the tape live, after F5 only "old" ones
+visible at top. /trades/public returns chronological ASC; WS addTrade
+prepends (newest-first) but fetchRecent wrote the server array as-is,
+so every load flipped the tape and newest trades sank below the fold.
+Fix: entries.sort((a,b) => b.ts - a.ts) before set/save in fetchRecent.
+Verified headless: place 3 market trades, login, tape top = newest
+(01:13:37 local); driver.refresh() -> tape top unchanged. localStorage
+round-trip head ts matches newest trade.

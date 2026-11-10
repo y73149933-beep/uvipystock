@@ -74,6 +74,10 @@ export const useTradesStore = create<TradesState>((set) => ({
           side: t.side,
           ts: t.ts,
         }));
+        // the endpoint returns chronological order while the feed renders
+        // first-item-on-top and WS adds prepend; without this the array
+        // flips on every page load and the newest trades sink to the bottom
+        entries.sort((a, b) => b.ts - a.ts);
         set({ recentTrades: entries });
         saveToStorage(entries);
       }
