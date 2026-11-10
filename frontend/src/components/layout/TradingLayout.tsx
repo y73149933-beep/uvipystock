@@ -35,9 +35,9 @@ export function TradingLayout({
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-panel text-gray-100">
       {header}
-      <div className="flex flex-1 gap-1 overflow-hidden p-1">
+      <div className="flex flex-1 min-h-0 gap-1 overflow-hidden p-1">
         {/* Left column: Order Book (55%) + Trades Feed (45%) */}
-        <div className="flex w-[280px] shrink-0 flex-col gap-1">
+        <div className="flex w-[280px] shrink-0 min-h-0 flex-col gap-1">
           <div className="h-[55%] overflow-hidden rounded border border-border bg-panelLight">
             {leftPanel}
           </div>
@@ -47,12 +47,12 @@ export function TradingLayout({
         </div>
 
         {/* Center: Chart (flex-1) */}
-        <main className="flex flex-1 flex-col overflow-hidden rounded border border-border bg-panelLight">
+        <main className="flex flex-1 min-h-0 flex-col overflow-hidden rounded border border-border bg-panelLight">
           {center}
         </main>
 
         {/* Right: Trade Form (300px) */}
-        <aside className="w-[300px] shrink-0 overflow-hidden rounded border border-border bg-panelLight">
+        <aside className="w-[300px] shrink-0 min-h-0 overflow-hidden rounded border border-border bg-panelLight">
           {rightPanel}
         </aside>
       </div>

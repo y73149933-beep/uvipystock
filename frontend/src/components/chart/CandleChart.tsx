@@ -257,13 +257,13 @@ export function CandleChart() {
   }, [orderbookSymbol, symbol, setSymbol]);
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full min-h-0 flex-col">
       <ChartToolbar
         symbol={symbol}
         timeframe={timeframe}
         onTimeframeChange={setTimeframe}
       />
-      <div ref={containerRef} className="relative flex-1">
+      <div ref={containerRef} className="relative flex-1 min-h-0">
         {loading && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-gray-500">
             Loading candles...

@@ -231,3 +231,20 @@ shows 0 ghosts, 0 stranded, balances reconcile to the last decimal.
 Unit tests: tests/unit/test_klines.py (7, fakeredis); fakeredis added
 to dev extras. E2E: paged whole 18h 1m history (12 pages) and matched
 PG truth bucket-for-bucket.
+
+## Time axis was clipped by layout (min-height:auto flex bug)
+
+Symptom: no time scale under the chart. The axis existed and rendered
+(pixel-probed the axis canvas: labels drawn), but the center column's
+flex item refused to shrink below its content height (flexbox
+min-height:auto default), so the chart overflowed its row and the
+220px Open Orders footer covered the 28px axis strip. Fixed with
+min-h-0 on the flex chain (row, main, columns, chart container).
+Verified headless via selenium/standalone-chrome in the compose
+network: axis label pixels present on screenshot (0 -> 276).
+
+Also: history now auto-backfills on load and timeframe switch (up to
+8 pages / 2000 candles via the next_end cursor) - switching 5m->1m no
+longer shows a 12-candle fragment; screenshots show full span after
+switch. Selenium harness for repeat UI checks: python:3.12-slim
+container + selenium/standalone-chrome on crypto-exchange_default.
