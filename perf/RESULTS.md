@@ -429,3 +429,17 @@ Tests: 4 new in test_critical_fixes (empty/thin/own-bids/liquid), 14/14 file.
 Live: empty book sell -> 400 no bids; after seeding 0.5@95 -> 28072 FILLED.
 NOTE: market orders always respond status 'new' synchronously — settlement
 is async worker; only rejection UX is at API time.
+
+## Own orders highlighted in chart depth
+
+DepthOverlay draws anonymous aggregated depth as green/red bars; user's own
+resting orders were indistinguishable. New "My orders" layer (toggle #4,
+persisted uvity.depthOverlay.myOrders, default on): violet (#8b5cf6) bars
+for own limit/post_only/iceberg NEW/PARTIALLY_FILLED orders on the current
+symbol, aggregated by side+price, scaled against max(bookVol, myVol) so
+sizes are comparable with the depth behind; left-end notch marker + label
+"B|S LMT|PO|ICE <qty>" (iceberg shows only its visible chunk, mirroring
+the anonymous book). Colors: book=green/red, my stops=amber dashed,
+public ladder=green/red hollow, mine=violet solid.
+Verified: pixel-diff violet count 0 (logged out) -> 1095 (3 own orders incl.
+iceberg @94/96/102); vision read labels "S LMT 0.2"/"B LMT 0.3" correct.

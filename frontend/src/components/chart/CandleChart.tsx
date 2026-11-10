@@ -14,6 +14,7 @@ interface DepthPrefs {
   book: boolean;
   stops: boolean;
   publicStops: boolean;
+  myOrders: boolean;
 }
 
 function loadDepthPrefs(): DepthPrefs {
@@ -25,12 +26,13 @@ function loadDepthPrefs(): DepthPrefs {
         book: parsed.book ?? true,
         stops: parsed.stops ?? true,
         publicStops: parsed.publicStops ?? true,
+        myOrders: parsed.myOrders ?? true,
       };
     }
   } catch {
     // ignore malformed prefs
   }
-  return { book: true, stops: true, publicStops: true };
+  return { book: true, stops: true, publicStops: true, myOrders: true };
 }
 
 function tfToSeconds(tf: string): number {
@@ -398,6 +400,7 @@ export function CandleChart() {
             showBook={depthPrefs.book}
             showStops={depthPrefs.stops}
             showPublic={depthPrefs.publicStops}
+            showMyOrders={depthPrefs.myOrders}
           />
         )}
         {/* hovered-candle OHLCV legend (imperatively updated) */}
@@ -457,6 +460,17 @@ export function CandleChart() {
           >
             <span className="inline-block h-2 w-2 rounded-sm bg-amber-400/90" />
             My stops
+          </button>
+          <span className="h-3 w-px bg-border" />
+          <button
+            onClick={() => toggleDepth("myOrders")}
+            title="Мои активные ордера на графике"
+            className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+              depthPrefs.myOrders ? "text-gray-100" : "text-gray-500"
+            } hover:text-white`}
+          >
+            <span className="inline-block h-2 w-2 rounded-sm bg-violet-400/90" />
+            My orders
           </button>
           <span className="h-3 w-px bg-border" />
           <button
