@@ -38,12 +38,28 @@ function tfToSeconds(tf: string): number {
   return map[tf] || 60;
 }
 
+function fmtNum(v: number): string {
+  if (Math.abs(v) >= 1000) return v.toFixed(2);
+  const s = v.toFixed(6);
+  return s.replace(/\.?0+$/, "") || "0";
+}
+
+function fmtTime(t: number, tf: string): string {
+  const d = new Date(t * 1000);
+  const hh = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+  if (tf === "1d") return d.toISOString().slice(0, 10);
+  if (tf === "4h" || tf === "1h") return `${d.toISOString().slice(5, 10)} ${hh}`;
+  return hh;
+}
+
 export function CandleChart() {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const lastBarTimeRef = useRef<number>(0);
+  const legendRef = useRef<HTMLDivElement>(null);
+  const candlesByTimeRef = useRef(new Map<number, { time: number; open: number; high: number; low: number; close: number; volume: number }>());
 
   const symbol = useChartStore((s) => s.symbol);
   const timeframe = useChartStore((s) => s.timeframe);
@@ -137,6 +153,32 @@ export function CandleChart() {
     setChartApi(chart);
     setSeriesApi(series);
 
+    const renderLegend = (c: { time: number; open: number; high: number; low: number; close: number; volume: number } | undefined, tf: string) => {
+      const el = legendRef.current;
+      if (!el) return;
+      if (!c) { el.style.display = "none"; return; }
+      el.style.display = "";
+      const up = c.close >= c.open;
+      const color = up ? "#22c55e" : "#ef4444";
+      el.innerHTML =
+        `<span style="color:#94a3b8">${fmtTime(c.time, tf)}</span>&nbsp;&nbsp;` +
+        `<span style="color:#94a3b8">O</span> <span style="color:${color}">${fmtNum(c.open)}</span>&nbsp;` +
+        `<span style="color:#94a3b8">H</span> <span style="color:${color}">${fmtNum(c.high)}</span>&nbsp;` +
+        `<span style="color:#94a3b8">L</span> <span style="color:${color}">${fmtNum(c.low)}</span>&nbsp;` +
+        `<span style="color:#94a3b8">C</span> <span style="color:${color}">${fmtNum(c.close)}</span>&nbsp;` +
+        `<span style="color:#94a3b8">Vol</span> <span style="color:#cbd5e1">${fmtNum(c.volume)}</span>`;
+    };
+
+    // hover info: the legend follows the crosshair; without hover it
+    // shows the most recent candle (imperative DOM updates to avoid a
+    // React re-render on every mouse move)
+    chart.subscribeCrosshairMove((param) => {
+      const bar = param.time !== undefined && param.point !== undefined
+        ? candlesByTimeRef.current.get(param.time as number)
+        : [...candlesByTimeRef.current.values()].pop();
+      renderLegend(bar, useChartStore.getState().timeframe);
+    });
+
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
@@ -170,6 +212,7 @@ export function CandleChart() {
       seriesRef.current.setData([]);
       volumeRef.current.setData([]);
       lastBarTimeRef.current = 0;
+      candlesByTimeRef.current.clear();
       setHasData(false);
       return;
     }
@@ -185,6 +228,7 @@ export function CandleChart() {
     }));
     seriesRef.current.setData(candleData);
     volumeRef.current.setData(volumeData);
+    candlesByTimeRef.current = new Map(candles.map((c) => [c.time, c]));
     lastBarTimeRef.current = candles[candles.length - 1].time;
     setHasData(true);
     hasCandlesRef.current = true;
@@ -293,6 +337,12 @@ export function CandleChart() {
             showPublic={depthPrefs.publicStops}
           />
         )}
+        {/* hovered-candle OHLCV legend (imperatively updated) */}
+        <div
+          ref={legendRef}
+          className="pointer-events-none absolute left-2 top-10 z-20 rounded border border-border bg-panelLight/85 px-2 py-1 font-mono text-[11px] backdrop-blur-sm"
+          style={{ display: "none" }}
+        />
         {/* depth overlay legend / toggles */}
         <div className="pointer-events-auto absolute left-2 top-2 z-20 flex items-center gap-1.5 rounded border border-border bg-panelLight/80 px-2 py-1 backdrop-blur-sm">
           <button

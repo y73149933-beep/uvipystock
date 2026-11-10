@@ -269,3 +269,13 @@ coverage across the plot 271/271 columns.
 Also: compose override fixes nginx healthchecks (busybox wget resolves
 localhost to ::1, nginx listens IPv4 only) and disables the copied
 backend-API healthcheck on the worker.
+
+## Hover candle tooltip (OHLCV legend)
+
+Chart now shows a monospace legend (top-left, under the Depth toggles)
+with time + O/H/L/C/Vol of the candle under the crosshair; colored by
+candle direction; falls back to the most recent candle when the pointer
+leaves the plot; hidden when there is no data. Updates are imperative
+DOM writes (no React re-render per mousemove). Verified headless:
+hover over a real bar reads "15:48 O 99 H 101 L 98.3 C 99 Vol 1.229",
+over idle bars "Vol 0", off-chart shows the last bar.
