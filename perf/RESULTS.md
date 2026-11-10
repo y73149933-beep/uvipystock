@@ -248,3 +248,24 @@ Also: history now auto-backfills on load and timeframe switch (up to
 longer shows a 12-candle fragment; screenshots show full span after
 switch. Selenium harness for repeat UI checks: python:3.12-slim
 container + selenium/standalone-chrome on crypto-exchange_default.
+
+## Idle-period candles + price/volume pane divider
+
+Kline reads now return synthetic flat bars (open=high=low=close=previous
+close, volume=0) for buckets with no trades — middle gaps, trailing gap
+to the window edge, and leading gap when the window continues older
+data (seeded from the last close before the window). Nothing is invented
+before the very first trade. get_range clamps absurd caller windows to
+MAX_CANDLES_PER_TF buckets (a test calling [0, 1e12] turned fill into a
+memory bomb; the clamp makes that class of caller error impossible).
+API check: 1m page total=500 real=12 flat=488 bucket_gaps=0; page join
+overlap=0 joined_gaps=0; real bars match PG per-bucket exactly (0 mism).
+
+Frontend: depth overlay strokes a 1px separator at 77% of pane height;
+candlestick scale bottom margin and volume top margin leave a gap
+exactly there. Screenshot: uniform divider row confirmed, candle
+coverage across the plot 271/271 columns.
+
+Also: compose override fixes nginx healthchecks (busybox wget resolves
+localhost to ::1, nginx listens IPv4 only) and disables the copied
+backend-API healthcheck on the worker.

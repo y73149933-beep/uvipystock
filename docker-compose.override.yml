@@ -3,3 +3,15 @@ services:
     ports: !reset ["127.0.0.1:5432:5432"]
   redis:
     ports: !reset ["127.0.0.1:6379:6379"]
+  frontend:
+    healthcheck:
+      # busybox wget resolves localhost to ::1 and nginx listens on IPv4 only
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+  admin:
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+  worker:
+    # backend image carries a HEALTHCHECK for the HTTP API; the worker has
+    # no port to probe (compose deliberately does not define one)
+    healthcheck:
+      disable: true

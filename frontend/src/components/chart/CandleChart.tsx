@@ -3,7 +3,7 @@ import { createChart, ColorType, type IChartApi, type ISeriesApi, type LogicalRa
 import { useChartStore } from "@/store/chartStore";
 import { useOrderbookStore } from "@/store/orderbookStore";
 import { ChartToolbar } from "./ChartToolbar";
-import { DepthOverlay } from "./DepthOverlay";
+import { DepthOverlay, PANE_DIVIDER_FRAC } from "./DepthOverlay";
 
 const DEPTH_PREFS_KEY = "uvity.depthOverlay";
 
@@ -117,13 +117,18 @@ export function CandleChart() {
       wickUpColor: "#22c55e", wickDownColor: "#ef4444",
     });
 
+    // price content ends above the divider, volume starts below it
+    chart.priceScale("right").applyOptions({
+      scaleMargins: { top: 0.08, bottom: 1 - PANE_DIVIDER_FRAC + 0.03 },
+    });
+
     const volume = chart.addHistogramSeries({
       priceFormat: { type: "volume" },
       priceScaleId: "volume",
       color: "rgba(14, 165, 233, 0.3)",
     });
     chart.priceScale("volume").applyOptions({
-      scaleMargins: { top: 0.8, bottom: 0 },
+      scaleMargins: { top: PANE_DIVIDER_FRAC + 0.03, bottom: 0.02 },
     });
 
     chartRef.current = chart;

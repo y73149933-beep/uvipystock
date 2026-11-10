@@ -60,6 +60,11 @@ const BID_COLOR = (a: number) => `rgba(34, 197, 94, ${a})`;
 const ASK_COLOR = (a: number) => `rgba(239, 68, 68, ${a})`;
 const BID_TEXT_COLOR = "#4ade80";
 const ASK_TEXT_COLOR = "#f87171";
+/** top margin of the volume price scale (fraction of pane height) */
+export const VOLUME_TOP = 0.8;
+/** y-fraction where the price/volume separator is stroked */
+export const PANE_DIVIDER_FRAC = 0.77;
+
 const STOP_COLOR = "rgba(251, 191, 36, 0.8)";
 const STOP_TEXT_COLOR = "#fbbf24";
 
@@ -140,6 +145,16 @@ export function DepthOverlay({
       const ob = useOrderbookStore.getState();
       const paneW = Math.max(0, cssSize.w - safeRightAxisWidth(chart));
       const paneH = Math.max(0, cssSize.h - safeTimeAxisHeight(chart));
+
+      // separator between the price pane and the volume pane; the two
+      // series' scaleMargins leave a gap exactly at this fraction
+      const divY = Math.round(paneH * PANE_DIVIDER_FRAC) + 0.5;
+      ctx.strokeStyle = "rgba(96, 125, 165, 0.55)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, divY);
+      ctx.lineTo(paneW, divY);
+      ctx.stroke();
       const anchorX = paneW; // bars grow leftwards from the price axis
       const maxBarW = Math.min(paneW * 0.55, 320);
 
