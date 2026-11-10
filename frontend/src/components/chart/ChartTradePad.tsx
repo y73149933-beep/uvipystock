@@ -30,14 +30,14 @@ export function ChartTradePad({ symbol, qty, setQty, msg, setMsg }: ChartTradePa
     <>
       {msg && (
         <div
-          className={`absolute right-2 top-11 z-30 max-w-[260px] truncate rounded border border-border bg-panelLight/90 px-2 py-0.5 text-[10px] backdrop-blur-sm ${
+          className={`absolute right-20 top-11 z-30 max-w-[260px] truncate rounded border border-border bg-panelLight/90 px-2 py-0.5 text-[10px] backdrop-blur-sm ${
             msg.ok ? "text-emerald-400" : "text-red-400"
           }`}
         >
           {msg.text}
         </div>
       )}
-      <div className="absolute right-2 top-2 z-30 flex items-center gap-1 rounded border border-border bg-panelLight/85 px-1.5 py-1 backdrop-blur-sm">
+      <div className="absolute right-20 top-2 z-30 flex items-center gap-1 rounded border border-border bg-panelLight/85 px-1.5 py-1 backdrop-blur-sm">
         <input
           value={qty}
           onChange={(e) => setQty(e.target.value)}
