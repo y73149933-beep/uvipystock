@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { normalizeDecimal } from "@/lib/format";
 import { Modal } from "@/components/common/Modal";
 import { Input } from "@/components/common/Input";
 import { Button } from "@/components/common/Button";
@@ -20,8 +21,8 @@ export function EditOrderModal({ order, open, onClose }: EditOrderModalProps) {
 
   // Reset when order changes
   if (order && open && !price && !quantity) {
-    setPrice(order.price ?? "");
-    setQuantity(order.remaining_quantity);
+    setPrice(order.price ? normalizeDecimal(order.price) : "");
+    setQuantity(normalizeDecimal(order.remaining_quantity));
   }
 
   const handleSubmit = async () => {

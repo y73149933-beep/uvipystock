@@ -31,6 +31,12 @@ export function formatQty(value: string | number | null | undefined, maxPrecisio
 /**
  * Format a USD-like value with thousands separators.
  */
+/** Raw backend DECIMAL string -> human-editable form: strips trailing
+ * fractional zeros without touching precision ("0.200...0" -> "0.2"). */
+export function normalizeDecimal(value: string): string {
+  return value.includes(".") ? value.replace(/0+$/, "").replace(/\.$/, "") : value;
+}
+
 export function formatUSD(value: string | number | null | undefined): string {
   if (value === null || value === undefined) return "—";
   try {

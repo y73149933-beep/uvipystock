@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useOrdersStore } from "@/store/ordersStore";
 import { ordersApi } from "@/api/orders";
-import { formatQty } from "@/lib/format";
+import { formatQty, normalizeDecimal } from "@/lib/format";
 import type { MyLevel } from "./chartOrderDrag";
 import type { Order } from "@/types/order";
 
@@ -20,7 +20,7 @@ export function OrderContextMenu({ level, x, y, onClose, onDone }: OrderContextM
   const setFocusOrder = useOrdersStore((s) => s.setFocusOrder);
   const [qty, setQty] = useState(() =>
     level.orderIds.length === 1
-      ? String(openOrders.find((o) => o.id === level.orderIds[0])?.remaining_quantity ?? "")
+      ? normalizeDecimal(openOrders.find((o) => o.id === level.orderIds[0])?.remaining_quantity ?? "")
       : "",
   );
 
