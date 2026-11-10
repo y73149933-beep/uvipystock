@@ -56,6 +56,8 @@ export function ChartContextMenu({ symbol, qty, menu, onDone, onClose }: ChartCo
     <div
       className="absolute z-40 w-44 rounded border border-border bg-panelLight shadow-xl"
       style={style}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
     >
       <div className="border-b border-border px-2 py-1 text-[10px] uppercase tracking-wider text-gray-500">

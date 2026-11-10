@@ -72,6 +72,8 @@ export function OrderContextMenu({ level, x, y, onClose, onDone }: OrderContextM
       className="absolute z-40 w-56 rounded border border-border bg-panelLight shadow-xl"
       style={{ left: Math.max(2, x), top: Math.max(2, y) }}
       onContextMenu={(e) => e.preventDefault()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
     >
       <div className="border-b border-border px-2 py-1 text-[10px] uppercase tracking-wider text-gray-500">
         {live[0].symbol} · {level.price} · {live.length === 1 ? `#${live[0].id}` : `${live.length} orders`}
