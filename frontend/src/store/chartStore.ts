@@ -65,11 +65,25 @@ export const useChartStore = create<ChartState>((set, get) => ({
   fetchCandles: async (symbol: string, timeframe: string) => {
     set({ loading: true });
     try {
-      const resp = await tradesApi.getCandles(symbol, timeframe, 500);
-      set({
-        candles: resp.candles || [], loading: false,
-        hasMore: !!resp.has_more, olderCursor: resp.next_end ?? null,
-      });
+      // First page alone can be a tiny fragment on short timeframes: the
+      // window is limit×tf and sparse histories pack few buckets into it.
+      // Backfill older pages right away (cursor = server next_end) up to
+      // a page cap; anything beyond stays scroll-loaded.
+      const MAX_INIT_PAGES = 8;
+      let all: Candle[] = [];
+      let cursor: number | null = null;
+      let more = false;
+      for (let page = 0; page < MAX_INIT_PAGES; page++) {
+        const resp = await tradesApi.getCandles(symbol, timeframe, 500,
+                                                page === 0 ? undefined : cursor ?? undefined);
+        const cs = resp.candles || [];
+        all = page === 0 ? [...cs] : [...cs, ...all];
+        cursor = resp.next_end ?? cursor;
+        more = !!resp.has_more;
+        if (!more || all.length >= MAX_CANDLES) break;
+      }
+      set({ candles: all.slice(-MAX_CANDLES), loading: false,
+            hasMore: more, olderCursor: cursor });
     } catch {
       set({ loading: false, candles: [], hasMore: false, olderCursor: null });
     }

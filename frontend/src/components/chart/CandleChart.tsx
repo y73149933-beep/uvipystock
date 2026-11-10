@@ -57,6 +57,7 @@ export function CandleChart() {
   const loadOlder = useChartStore((s) => s.loadOlder);
   const hasCandlesRef = useRef(false);
   const loadingOlderRef = useRef(false);
+  const needFitRef = useRef(false);
   // visible time range captured just before an older-page fetch, so the
   // viewport stays where the user was after the data is prepended
   const preserveRangeRef = useRef<Range<Time> | null>(null);
@@ -152,6 +153,7 @@ export function CandleChart() {
 
   // Fetch candles when symbol or timeframe changes
   useEffect(() => {
+    needFitRef.current = true; // new dataset: viewport must refit to it
     fetchCandles(symbol, timeframe);
   }, [symbol, timeframe, fetchCandles]);
 
@@ -187,6 +189,10 @@ export function CandleChart() {
     if (preserveRangeRef.current && chartRef.current) {
       chartRef.current.timeScale().setVisibleRange(preserveRangeRef.current);
       preserveRangeRef.current = null;
+    } else if (needFitRef.current && chartRef.current) {
+      // fresh dataset (initial load, symbol/timeframe switch): show it all
+      chartRef.current.timeScale().fitContent();
+      needFitRef.current = false;
     }
   }, [candles]);
 
