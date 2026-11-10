@@ -117,3 +117,39 @@ clean-slate purge as phase0 (cancel resting + purge stops/trailing/ob keys), bec
 P2–P4 residual liquidity measurably changes trigger/precheck outcomes. The market-buy
 precheck validates against visible ask volume only, so the iceberg hidden-reserve
 check drives in via two consecutive buys (visible first, then backfilled hidden).
+
+
+## Self-trade prevention (STP) — 2026-11-10
+
+Policy: a taker never matches its own resting orders. The maker order stays
+untouched in the book and the taker continues against other participants
+(skip-and-continue, classic "deactivate maker" flavour). Implemented at the
+matcher level so every entry point (market/limit/IOC/FOK/post-only, stop
+children, SL/TP children, bulk) inherits it for free.
+
+Engine (`engine.pxd/.pyx`): `user_id` added to `OrderNode`/`COrder`;
+matching loop skips same-user makers; FOK precheck sums only foreign
+volume (own liquidity never makes an FOK fillable); post-only resting
+check treats a level composed entirely of own orders as non-crossing
+(rests instead of rejecting). `user_id=0` = unknown owner (legacy/bench)
+and is never skipped, so benchmarks and old data keep working.
+Worker passes owner ids through `_bridge.build_corder`/`add_passive_order`
+and has a belt-and-braces guard dropping any same-user trade.
+
+Related fixes found while testing STP:
+- MARKET BUY lock (`_compute_market_buy_lock`) now excludes the taker's own
+  asks from its book walk. Without this, STP skipping an own (better) ask
+  made the real fill more expensive than the lock → "Insufficient locked
+  balance for settle" and a stranded order.
+- Worker: a settle ValueError now closes the order (EXPIRED) and releases
+  the reservation instead of leaving it in 'new' with funds locked.
+- perf harness: `api()` retry lost the `creds` argument and re-attributed
+  retried requests to the default user (harness bug, masked as "orders
+  owned by wrong user" in P5 STP run).
+
+Verification (perf38): P5 19/19 including
+- "STP: market buy skips own best ask, fills foreign level" (own ask stays
+  `new`, buy fills at foreign 99.0),
+- "STP: own-only liquidity → expired, no trades, funds released";
+engine unit tests 33/33 (6 new STP tests); 0 same-user trades across the
+whole run in DB; P3 regression 100/100 fills unchanged.

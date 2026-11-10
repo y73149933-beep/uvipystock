@@ -59,7 +59,7 @@ def engine():
 
 
 def _add_maker(engine, order_id, side, price, qty, is_iceberg=False,
-               visible_qty=None, hidden_qty=None):
+               visible_qty=None, hidden_qty=None, user_id=0):
     """Helper: add a resting maker order."""
     ok = engine.add_passive_order(
         order_id=order_id,
@@ -69,12 +69,13 @@ def _add_maker(engine, order_id, side, price, qty, is_iceberg=False,
         is_iceberg=is_iceberg,
         visible_qty=visible_qty if visible_qty is not None else qty,
         hidden_qty=hidden_qty if hidden_qty is not None else 0.0,
+        user_id=user_id,
     )
     assert ok, f"Failed to add maker order {order_id}"
 
 
 def _taker(engine, order_id, side, type_, price, qty, is_iceberg=False,
-           visible_qty=None, hidden_qty=None):
+           visible_qty=None, hidden_qty=None, user_id=0):
     """Helper: build a COrder and match it."""
     c = build_corder(
         order_id=order_id,
@@ -85,6 +86,7 @@ def _taker(engine, order_id, side, type_, price, qty, is_iceberg=False,
         is_iceberg=is_iceberg,
         visible_qty=visible_qty,
         hidden_qty=hidden_qty,
+        user_id=user_id,
     )
     trades, outcome, remaining = engine.match_active_order(c)
     return trades, outcome, remaining
@@ -465,3 +467,81 @@ def test_perf_smoke_100_orders(engine):
     prices, vols = engine.snapshot(C_SELL, depth=20)
     assert prices == []
     assert vols == []
+
+
+# ─── Self-trade prevention (STP) ─────────────────────────────────────────────
+
+def test_stp_same_user_never_self_matches(engine):
+    """A taker must never execute against its own resting order."""
+    _add_maker(engine, order_id=10, side=C_SELL, price=100.0, qty=1.0, user_id=7)
+    trades, outcome, remaining = _taker(engine, order_id=20, side="buy",
+                                        type_="limit", price=100.0, qty=1.0,
+                                        user_id=7)
+    assert trades == []
+    assert remaining == 1.0
+
+
+def test_stp_same_user_skips_to_foreign_liquidity(engine):
+    """Same-user best order is skipped; taker fills the next (foreign) one."""
+    _add_maker(engine, order_id=10, side=C_SELL, price=100.0, qty=1.0, user_id=7)
+    _add_maker(engine, order_id=11, side=C_SELL, price=100.0, qty=1.0, user_id=8)
+    trades, outcome, remaining = _taker(engine, order_id=20, side="buy",
+                                        type_="limit", price=100.0, qty=1.0,
+                                        user_id=7)
+    assert outcome == C_OK and remaining == 0.0
+    assert len(trades) == 1
+    assert trades[0]["maker_order_id"] == 11
+
+
+def test_stp_market_only_own_liquidity_no_liquidity(engine):
+    """Market order facing only its own liquidity → C_NO_LIQUIDITY, no fills."""
+    _add_maker(engine, order_id=10, side=C_SELL, price=100.0, qty=1.0, user_id=7)
+    trades, outcome, remaining = _taker(engine, order_id=20, side="buy",
+                                        type_="market", price=None, qty=1.0,
+                                        user_id=7)
+    assert trades == []
+    assert outcome == C_NO_LIQUIDITY
+
+
+def test_stp_fok_precheck_ignores_own_volume(engine):
+    """FOK must not count its own resting volume as fillable."""
+    _add_maker(engine, order_id=10, side=C_SELL, price=100.0, qty=1.0, user_id=7)
+    trades, outcome, remaining = _taker(engine, order_id=20, side="buy",
+                                        type_="fok", price=100.0, qty=1.0,
+                                        user_id=7)
+    assert outcome == C_FOK_REJECTED
+    assert trades == []
+    # ... but foreign volume at the same level makes it fillable
+    _add_maker(engine, order_id=11, side=C_SELL, price=100.0, qty=1.0, user_id=8)
+    trades, outcome, remaining = _taker(engine, order_id=21, side="buy",
+                                        type_="fok", price=100.0, qty=1.0,
+                                        user_id=7)
+    assert outcome == C_OK and len(trades) == 1
+    assert trades[0]["maker_order_id"] == 11
+
+
+def test_stp_post_only_rests_against_own_crossing_liquidity(engine):
+    """Post-Only facing only its OWN crossing orders rests instead of being
+    rejected (it could never self-cross anyway)."""
+    _add_maker(engine, order_id=10, side=C_SELL, price=100.0, qty=1.0, user_id=7)
+    trades, outcome, remaining = _taker(engine, order_id=20, side="buy",
+                                        type_="post_only", price=100.0, qty=1.0,
+                                        user_id=7)
+    assert outcome == C_OK          # rests, not C_POST_ONLY_CROSS
+    assert trades == []
+    assert remaining == 1.0
+    # foreign crossing liquidity present → still rejected
+    _add_maker(engine, order_id=11, side=C_SELL, price=100.0, qty=1.0, user_id=8)
+    trades, outcome, remaining = _taker(engine, order_id=21, side="buy",
+                                        type_="post_only", price=100.0, qty=1.0,
+                                        user_id=7)
+    assert outcome == C_POST_ONLY_CROSS
+
+
+def test_stp_legacy_zero_user_id_matches_freely(engine):
+    """user_id=0 (unknown owner / benchmark) is never STP-skipped."""
+    _add_maker(engine, order_id=10, side=C_SELL, price=100.0, qty=1.0, user_id=0)
+    trades, outcome, remaining = _taker(engine, order_id=20, side="buy",
+                                        type_="limit", price=100.0, qty=1.0,
+                                        user_id=0)
+    assert outcome == C_OK and len(trades) == 1
