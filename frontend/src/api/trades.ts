@@ -32,6 +32,8 @@ interface CandlesResponse {
   candles: Candle[];
   symbol: string;
   timeframe: string;
+  has_more?: boolean;
+  next_end?: number;
 }
 
 export const tradesApi = {
@@ -41,9 +43,9 @@ export const tradesApi = {
   listPublic: (symbol: string, limit: number = 50) =>
     api.get<PublicTradesResponse>(`/api/v1/trades/public/${symbol}`),
 
-  getCandles: (symbol: string, timeframe: string, limit: number = 500) =>
+  getCandles: (symbol: string, timeframe: string, limit: number = 500, end?: number) =>
     api.get<CandlesResponse>(
       `/api/v1/trades/candles/${symbol}`,
-      { timeframe, limit },
+      { timeframe, limit, ...(end !== undefined ? { end } : {}) },
     ),
 };

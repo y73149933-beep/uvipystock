@@ -40,8 +40,9 @@ export function useOrderbookFeed(symbol: string) {
         case "trade":
           addTrade(msg);
           applyTradeOptimistic(msg.price, msg.quantity, msg.side);
-          updateLastPrice(msg.price);
-          addTradeToCandle(msg.price, msg.quantity);
+          // bucket by the server print timestamp, not the client clock
+          updateLastPrice(msg.price, msg.ts);
+          addTradeToCandle(msg.price, msg.quantity, msg.ts);
           break;
       }
     });

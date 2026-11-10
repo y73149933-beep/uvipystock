@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { createChart, ColorType, type IChartApi, type ISeriesApi, type UTCTimestamp } from "lightweight-charts";
+import { createChart, ColorType, type IChartApi, type ISeriesApi, type LogicalRange, type Range, type Time, type UTCTimestamp } from "lightweight-charts";
 import { useChartStore } from "@/store/chartStore";
 import { useOrderbookStore } from "@/store/orderbookStore";
 import { ChartToolbar } from "./ChartToolbar";
@@ -54,6 +54,12 @@ export function CandleChart() {
   const fetchCandles = useChartStore((s) => s.fetchCandles);
   const updateLastPrice = useChartStore((s) => s.updateLastPrice);
   const addTradeToCandle = useChartStore((s) => s.addTradeToCandle);
+  const loadOlder = useChartStore((s) => s.loadOlder);
+  const hasCandlesRef = useRef(false);
+  const loadingOlderRef = useRef(false);
+  // visible time range captured just before an older-page fetch, so the
+  // viewport stays where the user was after the data is prepended
+  const preserveRangeRef = useRef<Range<Time> | null>(null);
 
   const orderbookSymbol = useOrderbookStore((s) => s.symbol);
   const bestBid = useOrderbookStore((s) => s.bids[0]?.price ?? null);
@@ -174,7 +180,32 @@ export function CandleChart() {
     volumeRef.current.setData(volumeData);
     lastBarTimeRef.current = candles[candles.length - 1].time;
     setHasData(true);
+    hasCandlesRef.current = true;
+
+    // Prepending an older page shifts logical indices; pin the user's
+    // viewport back to the time range they were looking at.
+    if (preserveRangeRef.current && chartRef.current) {
+      chartRef.current.timeScale().setVisibleRange(preserveRangeRef.current);
+      preserveRangeRef.current = null;
+    }
   }, [candles]);
+
+  // Infinite history: when the user scrolls to the left edge, fetch the
+  // next older page (server pages via the `end` cursor + has_more flag).
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !hasCandlesRef.current) return;
+    const ts = chart.timeScale();
+    const onRange = (range: LogicalRange | null) => {
+      if (!range || range.from > 5) return;
+      if (loadingOlderRef.current || !useChartStore.getState().hasMore) return;
+      loadingOlderRef.current = true;
+      preserveRangeRef.current = ts.getVisibleRange();
+      void loadOlder().finally(() => { loadingOlderRef.current = false; });
+    };
+    ts.subscribeVisibleLogicalRangeChange(onRange);
+    return () => ts.unsubscribeVisibleLogicalRangeChange(onRange);
+  }, [symbol, timeframe, loadOlder, candles.length === 0]);
 
   // Real-time price line from orderbook (when no candles exist yet)
   useEffect(() => {

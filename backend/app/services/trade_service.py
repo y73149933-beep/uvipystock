@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.enums import OrderSide, OrderStatus, OrderType
 from app.models.trade import Trade
 from app.redis_client import get_redis
-from app.redis_client import orderbook, orders_index, pubsub, queues, stops
+from app.redis_client import klines, orderbook, orders_index, pubsub, queues, stops
 from app.repositories.balance_repo import BalanceRepository
 from app.repositories.order_repo import OrderRepository
 from app.repositories.trade_repo import TradeRepository
@@ -309,6 +309,13 @@ class TradeService:
                  maker_order_id=trade.maker_order_id)
             for trade in persisted
         ]
+        # (price, qty, ts_seconds) for the kline cache — bucketed off the
+        # committed executed_at, never client clocks.
+        kline_items = [
+            (float(trade.price), float(trade.quantity),
+             int(trade.executed_at.timestamp()))
+            for trade in persisted
+        ]
         order_publish_args = []
         if taker_order is not None:
             event = "filled" if taker_order.status == OrderStatus.FILLED else "partially_filled"
@@ -334,6 +341,12 @@ class TradeService:
             ))
 
         async def _publish_fill_events() -> None:
+            # Kline cache first: warm buckets make chart reads cache-only.
+            # A cache failure must never suppress market-data fan-out.
+            try:
+                await klines.apply_trades(redis, symbol, kline_items)
+            except Exception:
+                logger.exception("kline cache update failed for %s", symbol)
             for kwargs in trade_publish_args:
                 await pubsub.publish_trade(redis, **kwargs)
             for kwargs in order_publish_args:

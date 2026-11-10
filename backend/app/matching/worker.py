@@ -542,6 +542,24 @@ class MatchingWorker:
 
         # 7. If taker has remaining qty and is LIMIT/POST_ONLY/ICEBERG → insert as resting
         if remaining > 0 and payload.type in ("limit", "post_only", "iceberg"):
+            # Phantom-rest guard: the row may have been canceled between its
+            # commit and this async place (the cancel removed the book entry
+            # that did not exist yet, released funds, and closed the row).
+            # Resting a closed row would manufacture a maker whose volume has
+            # no reservation behind it. FOR UPDATE serializes with a cancel
+            # racing us right now; whoever runs second sees the truth.
+            async with async_session_factory() as session:
+                async with session.begin():
+                    _row = await OrderRepository(session).get_for_update(payload.order_id)
+                    _row_status = _row.status if _row is not None else None
+            if _row_status not in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+                logger.warning(
+                    "[rest] order=%d row closed (%s) before rest - "
+                    "skipping phantom rest",
+                    payload.order_id,
+                    _row_status.value if _row_status else "missing",
+                )
+                return result
             logger.info(
                 "[rest] order=%d resting %s @ %s",
                 payload.order_id, remaining, payload.price,

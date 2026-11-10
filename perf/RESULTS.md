@@ -207,3 +207,27 @@ Note: taker_fee/maker_fee are recorded as 0 by design today
 (trade_service has a TODO to compute fees from pair settings) — the
 reconciliation validates principal movement; when fees are implemented
 this same audit must extend to fee accounting (fee wallet).
+
+## Kline cache + full candle history (2026-11-10)
+
+Chart backend: Redis kline cache (app.redis_client.klines), one ZSET per
+(symbol,timeframe), score=bucket, member=JSON OHLCV. Settlement folds
+every fill into its bucket incrementally (post-commit, single writer);
+REST windows older than the cache floor are aggregated from PG exactly
+once and materialized (seeded_from sentinel). GET /trades/candles gained
+end-cursor pagination + has_more + next_end (the cursor advances past
+empty windows in sparse histories; without it clients looped forever on
+an all-empty page — found by the e2e). The chart now pages history on
+left-edge scroll with viewport preservation, and buckets live trades by
+the server print ts instead of client clocks.
+
+Found and fixed while auditing: PHANTOM REST. A cancel landing between
+an order's commit and its async place removed a book entry that did not
+exist yet; the worker then rested the closed row into the book, HASH and
+index - a maker with no funds behind it, ready to be matched. Rest is
+now guarded by a FOR UPDATE row-state check. Repro harness (30 bulk
+races, 300 orders) hits the race 3/30 times; guard catches all, audit
+shows 0 ghosts, 0 stranded, balances reconcile to the last decimal.
+Unit tests: tests/unit/test_klines.py (7, fakeredis); fakeredis added
+to dev extras. E2E: paged whole 18h 1m history (12 pages) and matched
+PG truth bucket-for-bucket.

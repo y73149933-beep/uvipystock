@@ -1,15 +1,15 @@
 """Trade history REST endpoints."""
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import select
 
 from app.api.deps import AuthenticatedUser, SessionDep, require_permission
 from app.models.enums import OrderSide
 from app.models.trade import Trade
+from app.redis_client import get_redis, klines
 from app.repositories.trade_repo import TradeRepository
 from app.schemas.trade import TradeListResponse, TradeResponse
 
@@ -128,79 +128,48 @@ async def get_candles(
     symbol: str,
     timeframe: str = Query("1m", description="1m, 5m, 15m, 1h, 4h, 1d"),
     limit: int = Query(500, ge=1, le=1000),
+    end: int | None = Query(
+        None, ge=0,
+        description="Pagination cursor (unix seconds). When set, returns the "
+                    "`limit` candles strictly older than this bucket.",
+    ),
 ) -> dict:
-    """Aggregate historical trades into OHLCV candles.
+    """OHLCV candles for `symbol`, served from the Redis kline cache.
 
-    Queries the trades table for the last `limit * timeframe_seconds` period,
-    groups them into time buckets, and returns OHLCV data for charting.
+    The cache (app.redis_client.klines) is kept warm incrementally by the
+    settlement path; windows older than anything cached are aggregated
+    from the trades table exactly once and materialized into the cache.
+
+    Pagination: pass ``end`` = ``time`` of the oldest candle you have to
+    page further back. The response carries ``has_more`` (does PG hold
+    trades older than the returned window) so the client knows when to
+    stop requesting.
     """
-    tf_map = {
-        "1m": 60, "5m": 300, "15m": 900,
-        "1h": 3600, "4h": 14400, "1d": 86400,
-    }
-    tf_seconds = tf_map.get(timeframe, 60)
+    tf_seconds = klines.TF_SECONDS.get(timeframe, 60)
+    redis = get_redis()
 
-    # Calculate the start time: limit candles back from now
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(seconds=tf_seconds * limit)
+    now_bucket = klines.bucket_of(datetime.now(UTC).timestamp(), tf_seconds)
+    if end is not None:
+        hi_exclusive = klines.bucket_of(end, tf_seconds)
+        if hi_exclusive > now_bucket + tf_seconds:
+            hi_exclusive = now_bucket + tf_seconds
+    else:
+        hi_exclusive = now_bucket + tf_seconds
+    lo = hi_exclusive - tf_seconds * limit
 
-    # Query all trades for this symbol since `start`
-    stmt = (
-        select(Trade)
-        .where(Trade.symbol == symbol, Trade.executed_at >= start)
-        .order_by(Trade.executed_at.asc())
-    )
-    result = await session.execute(stmt)
-    trades = result.scalars().all()
-
-    if not trades:
-        return {"candles": [], "symbol": symbol, "timeframe": timeframe}
-
-    # Aggregate trades into candles
-    candles: list[dict] = []
-    current_bucket: int | None = None
-    current_candle: dict | None = None
-
-    for trade in trades:
-        # Calculate bucket time (unix seconds, floored to timeframe)
-        trade_ts = int(trade.executed_at.timestamp())
-        bucket = (trade_ts // tf_seconds) * tf_seconds
-
-        if current_bucket is None or bucket != current_bucket:
-            # Close previous candle
-            if current_candle is not None:
-                candles.append(current_candle)
-
-            # Start new candle
-            current_bucket = bucket
-            current_candle = {
-                "time": bucket,
-                "open": float(trade.price),
-                "high": float(trade.price),
-                "low": float(trade.price),
-                "close": float(trade.price),
-                "volume": float(trade.quantity),
-            }
-        else:
-            # Update current candle
-            price = float(trade.price)
-            current_candle["high"] = max(current_candle["high"], price)
-            current_candle["low"] = min(current_candle["low"], price)
-            current_candle["close"] = price
-            current_candle["volume"] += float(trade.quantity)
-
-    # Don't forget the last candle
-    if current_candle is not None:
-        candles.append(current_candle)
-
-    # Limit to `limit` candles (keep the most recent)
-    if len(candles) > limit:
-        candles = candles[-limit:]
+    await klines.ensure_window(session, redis, symbol, timeframe, lo, hi_exclusive)
+    candles = await klines.get_range(redis, symbol, timeframe, lo, hi_exclusive - tf_seconds, limit)
+    more = await klines.has_older_trades(session, symbol, lo)
 
     return {
         "candles": candles,
         "symbol": symbol,
         "timeframe": timeframe,
+        "has_more": more,
+        # cursor for the next (older) page = left edge of this window, even
+        # if the window contained no trades (sparse history must still page
+        # forward — otherwise clients loop forever on an empty window)
+        "next_end": lo,
     }
 
 

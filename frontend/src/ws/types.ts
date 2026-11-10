@@ -53,6 +53,8 @@ export interface TradePrintMsg extends WSMessageBase {
   price: number;
   quantity: number;
   side: string;
+  /** epoch milliseconds — canonical bucketing source for the chart */
+  ts: number;
 }
 
 export interface OrderUpdateMsg extends WSMessageBase {
