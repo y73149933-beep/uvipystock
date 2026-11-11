@@ -11,7 +11,7 @@
 | **Backend** | Python 3.11, FastAPI, Pydantic v2 | REST API, WebSocket, валидация |
 | **ORM** | SQLAlchemy 2.0 (async), Alembic | Модели, миграции |
 | **Matching Engine** | Cython 3.0 (`with nogil:`) | Price-Time Priority мэтчинг |
-| **Брокер/Кэш** | Redis 7 (Sorted Sets, Lists, Pub/Sub) | Стакан, очереди, события |
+| **Брокер/Кэш** | Redis 7 (Sorted Sets, Lists, Pub/Sub) | Стакан, очереди ордеров/стопов, события, kline-кэш |
 | **База данных** | PostgreSQL 15 | Источник истины для балансов |
 | **Frontend** | React 18, TypeScript, Vite, Tailwind | Торговый терминал |
 | **Admin** | React + TypeScript | Админ-панель |
@@ -172,8 +172,20 @@ BRPOP и PubSub `listen()` используют отдельные Redis-сое�
 - Health check PING конфликтов с blocking read
 - `retry_on_timeout` double-pop risk
 
-## Производительность
+### 6. Redis — самовосстанавливающийся кэш, PG — правда всего остального
+Любой Redis-индекс может быть потерян и восстановлен из PG без потери данных:
+- **Книга**: worker при старте и каждые 30s простаивания перекладывает
+  resting-ордера из PG; включён AOF для быстрых рестартов.
+- **Стоп-очереди** (ZSET на сторону): периодический rescan PENDING-стопов из PG.
+- **Kline-кэш** (`kline:{symbol}:{tf}` ZSET, score=epoch бакета): settlement
+  инкрементально сводит филлы во все 6 ТФ; история до кэшированного окна
+  доматериализуется из PG лениво (проверка покрытия по самому старому
+  бару, sentinel сам по себе покрытие не доказывает); кап 50k баров на ТФ.
+- **WS**: сервер не хранит недоставленные сообщения — клиент после
+  reconnect догружает ленту и окна свечей через REST (единица времени
+  во всех каналах — epoch-миллисекунды).
 
+## Производительность
 | Метрика | Значение |
 |---|---|
 | Throughput | 1.2M ордеров/сек |

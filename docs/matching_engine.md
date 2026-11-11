@@ -115,6 +115,7 @@ cdef class CMatchingEngine:
    for each price level (best first):
      if price check fails (market除外): break
      for each order at level (FIFO):
+       if maker_user_id == taker_user_id: skip (STP — см. ниже)
        compute fill_qty = min(incoming.remaining, maker.visible)
        update remaining quantities
        emit TradeResult
@@ -123,6 +124,19 @@ cdef class CMatchingEngine:
    if level empty: remove + compact
 4. Return outcome + trades + remaining
 ```
+
+### Self-Trade Prevention (skip maker)
+Тейкер не может исполниться против собственной resting-заявки: на обходе
+встречной стороны ордера с `maker_user_id == taker_user_id` **пропускаются**
+(не удаляются из книги — maker остаётся ждать своего чужого тейкера), а
+обход продолжается к худшим ценам. Следствия:
+- Самозачёт (wash) невозможно собрать одним пользователем; для сделки в
+  тестах нужны два аккаунта.
+- Пре-guard-ы ликвидности маркет-ордеров (`_require_market_buy_liquidity` /
+  `_require_market_sell_liquidity`) при обходе встречной стороны исключают
+  собственные заявки — поведение API и движка совпадают: `MARKET SELL`
+  против стакана, где стоят только свои bid-ы, получает 400 сразу, без
+  «new → expired» мелькания.
 
 ### Iceberg refill
 Когда видимая часть iceberg исчерпана:
